@@ -10,7 +10,7 @@ from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
-from sentence_transformers import SentenceTransformer
+from sklearn.feature_extraction.text import HashingVectorizer
 
 from config import CACHE_DIR, DB_PATH, settings
 from file_analyzer import analyze_file
@@ -39,8 +39,26 @@ class MetadataIndexer:
     def __init__(self):
         self.conn = sqlite3.connect(DB_PATH, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
-        self.model = SentenceTransformer(settings.embedding_model)
+        self.embedding_backend = settings.embedding_backend
+        self.vectorizer = HashingVectorizer(n_features=256, alternate_sign=False, norm=None)
+        self.model = None
         self._create_tables()
+
+    def _get_model(self):
+        if self.embedding_backend != "sentence_transformers":
+            return None
+        if self.model is None:
+            from sentence_transformers import SentenceTransformer
+
+            self.model = SentenceTransformer(settings.embedding_model)
+        return self.model
+
+    def _embed_text(self, text: str) -> List[float]:
+        if self.embedding_backend == "sentence_transformers":
+            model = self._get_model()
+            return model.encode(text).tolist()
+        vector = self.vectorizer.transform([text]).toarray()[0]
+        return vector.astype(float).tolist()
 
     def _create_tables(self) -> None:
         self.conn.execute(
@@ -101,7 +119,7 @@ class MetadataIndexer:
                 analysis.get("text_content", "")[:5000],
             ]
         )
-        embedding = self.model.encode(combined_text).tolist()
+        embedding = self._embed_text(combined_text)
         self.conn.execute(
             """
             INSERT INTO files (
@@ -352,10 +370,12 @@ class MetadataIndexer:
         rows = self.conn.execute("SELECT * FROM files").fetchall()
         if not rows:
             return []
-        q_emb = self.model.encode(query)
+        q_emb = np.array(self._embed_text(query))
         scored = []
         for row in rows:
             emb = np.array(json.loads(row["embedding_json"]))
+            if emb.shape != q_emb.shape:
+                continue
             sim = float(np.dot(q_emb, emb) / (np.linalg.norm(q_emb) * np.linalg.norm(emb) + 1e-9))
             scored.append((sim, dict(row)))
         scored.sort(key=lambda x: x[0], reverse=True)

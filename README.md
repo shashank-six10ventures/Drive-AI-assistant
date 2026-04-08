@@ -71,6 +71,7 @@ GEMINI_API_KEY=...
 HUGGINGFACE_API_KEY=...
 AMAZON_MARKETPLACE=amazon.in
 BUSINESS_ROLE=leadership
+EMBEDDING_BACKEND=hashing
 ```
 
 If you mainly use Claude, set:
@@ -120,9 +121,10 @@ You must use Service Account or OAuth credentials JSON because Drive listing/dow
 
 At startup the app follows this order:
 
-1. Try Google Drive sync and indexing.
-2. If Drive works and files exist: use real Drive data.
-3. If Drive fails (missing credentials/API error) or folder is empty: auto-load demo data.
+1. Check whether real Drive data is already indexed in SQLite.
+2. If indexed real data exists: use it immediately.
+3. Otherwise: load demo data fast so Streamlit can start cleanly.
+4. Use `Run Monitor Once` from the sidebar to fetch fresh Google Drive data on demand.
 
 UI shows one of:
 - `Using Google Drive data`
@@ -144,6 +146,18 @@ When LLM mode is off:
 - summaries, briefs, and dataset commentary use deterministic fallback text
 
 This is the recommended default mode if you want to keep API costs controlled.
+
+## Fast Startup Embeddings
+
+The app now defaults to:
+
+```bash
+EMBEDDING_BACKEND=hashing
+```
+
+This avoids large model downloads on Streamlit Cloud and keeps app startup fast enough for health checks.
+
+You can still change this later if you want a heavier embedding stack, but `hashing` is the safest deployment choice.
 
 ## Business Workflows
 

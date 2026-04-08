@@ -92,6 +92,7 @@ class Settings:
     tavily_api_key: str = _get_setting("TAVILY_API_KEY", "")
     amazon_marketplace: str = _get_setting("AMAZON_MARKETPLACE", "amazon.in")
     business_role: str = _get_setting("BUSINESS_ROLE", "leadership")
+    embedding_backend: str = _get_setting("EMBEDDING_BACKEND", "hashing").lower()
 
     embedding_model: str = _get_setting("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
     max_text_chars: int = _as_int("MAX_TEXT_CHARS", 20000)

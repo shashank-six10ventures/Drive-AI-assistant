@@ -120,31 +120,18 @@ def bootstrap_data_source(indexer: MetadataIndexer) -> None:
     if st.session_state.get("data_bootstrap_done"):
         return
 
-    source = "demo"
-    detail = ""
-    try:
-        monitor = DriveMonitor()
-        monitor.run_once()
-        real_count = indexer.count_real_files()
-        if real_count > 0:
-            indexer.remove_dummy_data()
-            source = "google_drive"
-            detail = f"Using Google Drive data ({real_count} files indexed)."
-        else:
-            seeded = _ensure_demo_data(indexer)
-            source = "demo"
-            detail = (
-                "Drive folder is empty. Using demo data."
-                if seeded > 0
-                else "Drive folder is empty. No records available."
-            )
-    except Exception as exc:
+    real_count = indexer.count_real_files()
+    if real_count > 0:
+        indexer.remove_dummy_data()
+        source = "google_drive"
+        detail = f"Using Google Drive data ({real_count} files already indexed)."
+    else:
         seeded = _ensure_demo_data(indexer)
         source = "demo"
         detail = (
-            f"Drive unavailable ({exc}). Using demo data."
+            "Startup uses demo data by default. Click `Run Monitor Once` to sync Google Drive."
             if seeded > 0
-            else f"Drive unavailable ({exc}). No data available."
+            else "No indexed data yet. Click `Run Monitor Once` to sync Google Drive."
         )
 
     st.session_state["data_source"] = source
