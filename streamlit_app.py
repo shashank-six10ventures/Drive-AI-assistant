@@ -33,6 +33,7 @@ def get_services():
 
 def init_session() -> None:
     st.session_state.setdefault("chat_history", [])
+    st.session_state.setdefault("chat_turn_counter", 0)
     st.session_state.setdefault("last_results", [])
     st.session_state.setdefault("last_selected_files", [])
     st.session_state.setdefault("selected_items", [])
@@ -139,7 +140,7 @@ def bootstrap_data_source(indexer: MetadataIndexer) -> None:
     st.session_state["data_bootstrap_done"] = True
 
 
-def _result_card(r: dict) -> None:
+def _result_card(r: dict, key_prefix: str = "live", interactive: bool = True) -> None:
     keywords = ", ".join(json.loads(r.get("keywords", "[]")))
     link = r.get("file_link", "")
     item_kind = r.get("item_kind", "file")
@@ -159,14 +160,20 @@ def _result_card(r: dict) -> None:
         f"- Similarity score: `{r.get('score', '-')}`  \n"
         f"{link_line}"
     )
-    st.write(r["summary"])
+    summary_text = (r.get("summary") or "").strip()
+    if len(summary_text) > 220:
+        summary_text = summary_text[:220].rstrip() + "..."
+    if summary_text:
+        st.write(summary_text)
+    if not interactive:
+        return
     col1, col2 = st.columns(2)
     with col1:
         if r["file_id"] in st.session_state["selected_items"]:
-            if st.button(f"Remove from basket: {r['file_name']}", key=f"remove_{r['file_id']}"):
+            if st.button(f"Remove from basket: {r['file_name']}", key=f"{key_prefix}_remove_{r['file_id']}"):
                 _remove_selected_item(r["file_id"])
         else:
-            if st.button(f"Add to basket: {r['file_name']}", key=f"add_{r['file_id']}"):
+            if st.button(f"Add to basket: {r['file_name']}", key=f"{key_prefix}_add_{r['file_id']}"):
                 _add_selected_item(r["file_id"])
     with col2:
         if item_kind == "file" and r.get("local_path") and Path(r["local_path"]).exists():
@@ -175,16 +182,26 @@ def _result_card(r: dict) -> None:
                     f"Download {r['file_name']}",
                     data=file_handle.read(),
                     file_name=r["file_name"],
-                    key=f"download_chat_{r['file_id']}",
+                    key=f"{key_prefix}_download_chat_{r['file_id']}",
                 )
 
 
-def _load_context_datasets(indexer: MetadataIndexer, analytics: AnalyticsEngine) -> List[Dict]:
-    file_ids = (
-        st.session_state["selected_items"]
-        or st.session_state["last_selected_files"]
-        or [r["file_id"] for r in st.session_state["last_results"]]
-    )
+def _load_context_datasets(
+    indexer: MetadataIndexer,
+    analytics: AnalyticsEngine,
+    query: str = "",
+    prefer_selected: bool = False,
+) -> List[Dict]:
+    query_lower = query.lower()
+    use_basket = prefer_selected or any(token in query_lower for token in ["selected", "basket", "picked"])
+    if st.session_state["last_selected_files"]:
+        file_ids = st.session_state["last_selected_files"]
+    elif use_basket and st.session_state["selected_items"]:
+        file_ids = st.session_state["selected_items"]
+    else:
+        file_ids = [r["file_id"] for r in st.session_state["last_results"]]
+        if not file_ids and st.session_state["selected_items"]:
+            file_ids = st.session_state["selected_items"]
     datasets = []
     for fid in file_ids:
         info = indexer.get_file(fid)
@@ -203,7 +220,25 @@ def _load_context_datasets(indexer: MetadataIndexer, analytics: AnalyticsEngine)
 def _show_chat_history() -> None:
     for msg in st.session_state["chat_history"]:
         with st.chat_message(msg["role"]):
+            if msg["role"] == "assistant" and msg.get("for_query"):
+                st.caption(f"Response to: {msg['for_query']}")
             st.write(msg["content"])
+            if msg["role"] == "assistant" and msg.get("results"):
+                with st.expander(f"Results for this question ({len(msg['results'])})", expanded=False):
+                    for idx, result in enumerate(msg["results"][:8], start=1):
+                        st.markdown(f"**{idx}. {result['file_name']}**  \nKind: `{result.get('item_kind', 'file')}`  \nUploader: `{result.get('uploader_name', '-')}`")
+            if msg["role"] == "assistant" and msg.get("compare_rows"):
+                with st.expander("Comparison output", expanded=False):
+                    st.dataframe(pd.DataFrame(msg["compare_rows"]), use_container_width=True)
+            if msg["role"] == "assistant" and msg.get("rename_preview"):
+                with st.expander("Rename preview", expanded=False):
+                    st.dataframe(pd.DataFrame(msg["rename_preview"]), use_container_width=True)
+            if msg["role"] == "assistant" and msg.get("alerts_rows"):
+                with st.expander("Alerts", expanded=False):
+                    st.dataframe(pd.DataFrame(msg["alerts_rows"]), use_container_width=True)
+            if msg["role"] == "assistant" and msg.get("market_rows"):
+                with st.expander("Market comparison", expanded=False):
+                    st.dataframe(pd.DataFrame(msg["market_rows"]), use_container_width=True)
 
 
 def _summarize_results_rule_based(results: List[Dict]) -> str:
@@ -257,8 +292,24 @@ def _summarize_market_compare_rule_based(compare_df: pd.DataFrame) -> str:
     )
 
 
+def _scroll_chat_to_bottom() -> None:
+    st.components.v1.html(
+        """
+        <script>
+        const scrollTarget = window.parent.document.querySelector('[data-testid="stAppViewContainer"]');
+        if (scrollTarget) {
+            window.parent.requestAnimationFrame(() => {
+                window.parent.scrollTo({ top: scrollTarget.scrollHeight, behavior: "smooth" });
+            });
+        }
+        </script>
+        """,
+        height=0,
+    )
+
+
 def _run_analytics_query(query: str, intent: dict, indexer: MetadataIndexer, analytics: AnalyticsEngine):
-    datasets = _load_context_datasets(indexer, analytics)
+    datasets = _load_context_datasets(indexer, analytics, query=query)
 
     if not datasets:
         return {"text": "No tabular datasets available from the current context.", "compare_df": None, "trend_fig": None}
@@ -287,7 +338,7 @@ def _run_analytics_query(query: str, intent: dict, indexer: MetadataIndexer, ana
 
 
 def _run_combine_query(indexer: MetadataIndexer, analytics: AnalyticsEngine):
-    datasets = _load_context_datasets(indexer, analytics)
+    datasets = _load_context_datasets(indexer, analytics, query="combine", prefer_selected=True)
     if len(datasets) < 2:
         return {"text": "Select or search at least two tabular files before combining them.", "combined_df": None}
     combined_df = analytics.combine_datasets(datasets)
@@ -309,7 +360,7 @@ def _run_folder_contents_query(query: str, indexer: MetadataIndexer):
 
 
 def _run_alerts_query(indexer: MetadataIndexer, analytics: AnalyticsEngine):
-    datasets = _load_context_datasets(indexer, analytics)
+    datasets = _load_context_datasets(indexer, analytics, query="alerts")
     alerts = analytics.business_alerts(datasets)
     st.session_state["latest_alerts"] = alerts
     if not alerts:
@@ -319,7 +370,7 @@ def _run_alerts_query(indexer: MetadataIndexer, analytics: AnalyticsEngine):
 
 
 def _run_executive_brief(indexer: MetadataIndexer, analytics: AnalyticsEngine, ai_router: AIRouter):
-    datasets = _load_context_datasets(indexer, analytics)
+    datasets = _load_context_datasets(indexer, analytics, query="executive brief")
     if not datasets:
         return {"text": "Select or search tabular files first so I can build an executive brief."}
     brief = analytics.executive_brief(datasets)
@@ -377,7 +428,7 @@ def _run_rename_query(query: str, indexer: MetadataIndexer, apply_changes: bool)
 def _run_web_compare_query(query: str, indexer: MetadataIndexer, analytics: AnalyticsEngine, ai_router: AIRouter):
     domains = ["amazon.com", "amazon.in"] if "amazon" in query.lower() else None
     web_results = ai_router.search_web(query, domains=domains)
-    datasets = _load_context_datasets(indexer, analytics)
+    datasets = _load_context_datasets(indexer, analytics, query=query)
     if not web_results:
         return {"text": "Web comparison needs `TAVILY_API_KEY` in secrets, or the search returned no results.", "comparison": ""}
     dataset_context = []
@@ -399,7 +450,7 @@ def _run_web_compare_query(query: str, indexer: MetadataIndexer, analytics: Anal
 
 
 def _run_amazon_compare_query(query: str, indexer: MetadataIndexer, analytics: AnalyticsEngine, ai_router: AIRouter):
-    datasets = _load_context_datasets(indexer, analytics)
+    datasets = _load_context_datasets(indexer, analytics, query=query)
     if not datasets:
         return {"text": "Select or search a dataset first so I know what to compare against Amazon.", "comparison_df": None}
 
@@ -568,6 +619,10 @@ if user_query:
         value not in [None, "", []]
         for value in [filters.get("uploader"), filters.get("year"), filters.get("file_type"), filters.get("item_kind"), filters.get("keywords")]
     )
+    has_specific_filters = any(
+        value not in [None, "", []]
+        for value in [filters.get("uploader"), filters.get("year"), filters.get("file_type"), filters.get("keywords")]
+    )
 
     lower = user_query.lower().strip()
     is_follow_up = lower.startswith("from these") or "across them" in lower
@@ -575,6 +630,7 @@ if user_query:
     assistant_text = ""
     st.session_state["latest_results"] = []
     st.session_state["latest_compare_df"] = None
+    st.session_state["latest_alerts"] = []
     trend_fig = None
     combined_df = None
     web_comparison = ""
@@ -641,6 +697,7 @@ if user_query:
                 "what are the files",
             ]
         )
+        should_use_builtin_search = should_use_builtin_search and not has_specific_filters
         results = (
             search_engine.search(user_query, top_k=12)
             if should_use_builtin_search
@@ -650,20 +707,35 @@ if user_query:
         )
         st.session_state["last_results"] = results
         st.session_state["latest_results"] = results
-        st.session_state["last_selected_files"] = [r["file_id"] for r in results[:5]]
+        st.session_state["last_selected_files"] = []
         folders = len([r for r in results if r.get("item_kind") == "folder"])
         files = len([r for r in results if r.get("item_kind", "file") == "file"])
         assistant_text = f"I found {len(results)} matching items ({files} files, {folders} folders)."
         if not results:
             assistant_text = "No matching Drive items found. Try a folder name, file name, uploader, or keyword."
 
-    st.session_state["chat_history"].append({"role": "assistant", "content": assistant_text})
+    turn_id = st.session_state["chat_turn_counter"] + 1
+    st.session_state["chat_turn_counter"] = turn_id
+    assistant_turn = {
+        "role": "assistant",
+        "content": assistant_text,
+        "for_query": user_query,
+        "results": st.session_state["latest_results"],
+        "compare_rows": st.session_state["latest_compare_df"].to_dict(orient="records")
+        if st.session_state["latest_compare_df"] is not None
+        else None,
+        "rename_preview": rename_preview,
+        "alerts_rows": st.session_state.get("latest_alerts"),
+        "market_rows": market_compare_df.to_dict(orient="records") if market_compare_df is not None else None,
+    }
+    st.session_state["chat_history"].append(assistant_turn)
     with st.chat_message("assistant"):
+        st.caption(f"Response to: {user_query}")
         st.write(assistant_text)
 
         if st.session_state["latest_results"]:
             for r in st.session_state["latest_results"]:
-                _result_card(r)
+                _result_card(r, key_prefix=f"turn_{turn_id}", interactive=True)
 
             if ai_router.can_use_llm():
                 compact = [
@@ -742,6 +814,8 @@ if user_query:
 
         if web_comparison:
             st.write(web_comparison)
+
+    _scroll_chat_to_bottom()
 
 
 st.divider()

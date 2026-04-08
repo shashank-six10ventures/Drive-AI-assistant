@@ -77,11 +77,36 @@ class SemanticSearchEngine:
             out = filtered
         return out
 
+    def _rank_rows(self, query: str, rows: List[Dict], top_k: int) -> List[Dict]:
+        if not rows:
+            return []
+        q_tokens = [token for token in re.split(r"\W+", query.lower()) if token]
+        ranked = []
+        for row in rows:
+            haystack = " ".join(
+                [
+                    row.get("file_name", ""),
+                    row.get("path_text", ""),
+                    row.get("summary", ""),
+                    row.get("topic", ""),
+                    row.get("uploader_name", ""),
+                ]
+            ).lower()
+            lexical_score = sum(1 for token in q_tokens if token in haystack)
+            ranked.append((lexical_score, row))
+        ranked.sort(key=lambda item: (item[0], item[1].get("updated_at", "")), reverse=True)
+        return [row for _, row in ranked[:top_k]]
+
     def search_with_filters(self, query: str, filters: Dict, top_k: int = 10, base_rows: List[Dict] | None = None) -> List[Dict]:
-        candidates = base_rows if base_rows is not None else self.indexer.semantic_search(query, top_k=top_k)
+        if base_rows is not None:
+            candidates = base_rows
+        else:
+            item_kind = (filters or {}).get("item_kind")
+            candidates = self.indexer.list_items(item_kind=item_kind)
         merged_filters = {"uploader": None, "year": None, "file_type": None, "item_kind": None, "keywords": []}
         merged_filters.update(filters or {})
         results = self._apply_filters(candidates, merged_filters)
+        results = self._rank_rows(query, results, top_k=top_k)
         self.memory.add_turn(query, [r["file_id"] for r in results])
         self.memory.last_results = results
         return results
