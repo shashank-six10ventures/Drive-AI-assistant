@@ -1,0 +1,15 @@
+streamlit>=1.33.0
+pandas>=2.2.0
+openpyxl>=3.1.2
+plotly>=5.20.0
+requests>=2.31.0
+sentence-transformers>=2.6.1
+numpy>=1.26.4
+scikit-learn>=1.4.2
+google-api-python-client>=2.125.0
+google-auth>=2.29.0
+google-auth-httplib2>=0.2.0
+google-auth-oauthlib>=1.2.0
+PyPDF2>=3.0.1
+python-docx>=1.1.0
+python-pptx>=0.6.23
