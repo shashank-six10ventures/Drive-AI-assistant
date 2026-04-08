@@ -270,6 +270,31 @@ class MetadataIndexer:
         self.conn.commit()
         return len(ids)
 
+    def ensure_dummy_data_ready(self) -> int:
+        # Repairs stale demo state where dummy rows exist but local files are missing.
+        dummy_rows = self.conn.execute(
+            "SELECT file_id, local_path FROM files WHERE file_id LIKE 'dummy_%'"
+        ).fetchall()
+        if not dummy_rows:
+            seeded = self.seed_dummy_data_if_empty()
+            return 3 if seeded else 0
+
+        valid_local_files = 0
+        for row in dummy_rows:
+            local_path = row["local_path"] or ""
+            if local_path and Path(local_path).exists():
+                valid_local_files += 1
+
+        if valid_local_files > 0:
+            return valid_local_files
+
+        self.remove_dummy_data()
+        self.seed_dummy_data_if_empty()
+        repaired_rows = self.conn.execute(
+            "SELECT COUNT(*) AS c FROM files WHERE file_id LIKE 'dummy_%'"
+        ).fetchone()["c"]
+        return int(repaired_rows)
+
     def _build_dummy_datasets(self) -> List[Dict]:
         # Temporary sample files for local testing when Drive data is unavailable.
         datasets = [

@@ -1,5 +1,6 @@
 import os
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -22,7 +23,9 @@ def _get_setting(name: str, default: str = "") -> str:
     if st is not None:
         try:
             secret_value = st.secrets.get(name, default)
-            if isinstance(secret_value, (dict, list)):
+            if isinstance(secret_value, Mapping):
+                return json.dumps(dict(secret_value))
+            if isinstance(secret_value, list):
                 return json.dumps(secret_value)
             return str(secret_value)
         except Exception:

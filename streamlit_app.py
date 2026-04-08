@@ -40,6 +40,19 @@ def init_session() -> None:
     st.session_state.setdefault("data_bootstrap_done", False)
 
 
+def _ensure_demo_data(indexer: MetadataIndexer) -> int:
+    repair = getattr(indexer, "ensure_dummy_data_ready", None)
+    if callable(repair):
+        return repair()
+    seed = getattr(indexer, "seed_dummy_data_if_empty", None)
+    if callable(seed):
+        result = seed()
+        if isinstance(result, bool):
+            return 3 if result else 0
+        return int(result or 0)
+    return 0
+
+
 def bootstrap_data_source(indexer: MetadataIndexer) -> None:
     if st.session_state.get("data_bootstrap_done"):
         return
@@ -55,7 +68,7 @@ def bootstrap_data_source(indexer: MetadataIndexer) -> None:
             source = "google_drive"
             detail = f"Using Google Drive data ({real_count} files indexed)."
         else:
-            seeded = indexer.ensure_dummy_data_ready()
+            seeded = _ensure_demo_data(indexer)
             source = "demo"
             detail = (
                 "Drive folder is empty. Using demo data."
@@ -63,7 +76,7 @@ def bootstrap_data_source(indexer: MetadataIndexer) -> None:
                 else "Drive folder is empty. No records available."
             )
     except Exception as exc:
-        seeded = indexer.ensure_dummy_data_ready()
+        seeded = _ensure_demo_data(indexer)
         source = "demo"
         detail = (
             f"Drive unavailable ({exc}). Using demo data."
@@ -169,7 +182,7 @@ with st.sidebar:
                 st.session_state["data_source_detail"] = "Using Google Drive data."
         except Exception as exc:
             st.error(f"Drive sync failed: {exc}")
-            indexer.ensure_dummy_data_ready()
+            _ensure_demo_data(indexer)
             st.session_state["data_source"] = "demo"
             st.session_state["data_source_detail"] = f"Drive sync failed ({exc}). Using demo data."
 
