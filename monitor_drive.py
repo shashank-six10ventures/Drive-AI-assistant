@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import logging
+import re
 import smtplib
 import time
 from email.mime.text import MIMEText
@@ -71,13 +72,28 @@ class DriveMonitor:
                 token_path.write_text(creds.to_json(), encoding="utf-8")
             return creds
         if settings.google_service_account_json.strip():
-            service_account_info = json.loads(settings.google_service_account_json)
+            service_account_info = self._parse_service_account_json(settings.google_service_account_json)
             return Credentials.from_service_account_info(service_account_info, scopes=SCOPES)
         if not Path(settings.google_service_account_file).exists():
             raise FileNotFoundError(
                 f"Service account file not found: {settings.google_service_account_file}"
             )
         return Credentials.from_service_account_file(settings.google_service_account_file, scopes=SCOPES)
+
+    def _parse_service_account_json(self, raw_json: str) -> Dict:
+        try:
+            return json.loads(raw_json)
+        except json.JSONDecodeError:
+            # Streamlit secrets sometimes end up with literal newlines inside private_key.
+            fixed_json = re.sub(
+                r'("private_key"\s*:\s*")(.*?)("\s*,)',
+                lambda match: match.group(1)
+                + match.group(2).replace("\\", "\\\\").replace("\r", "").replace("\n", "\\n")
+                + match.group(3),
+                raw_json,
+                flags=re.DOTALL,
+            )
+            return json.loads(fixed_json)
 
     def extract_file_metadata(self, drive_file: Dict) -> Dict:
         # Normalizes raw Drive payload into metadata used by the index.
