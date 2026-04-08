@@ -40,7 +40,7 @@ class SemanticSearchEngine:
     def _apply_filters(self, rows: List[Dict], filters: Dict) -> List[Dict]:
         out = rows
         if filters.get("uploader"):
-            u = filters["uploader"]
+            u = str(filters["uploader"]).lower()
             out = [r for r in out if u in r.get("uploader_name", "").lower()]
         if filters.get("year"):
             y = filters["year"]
@@ -69,6 +69,12 @@ class SemanticSearchEngine:
 
     def search(self, query: str, top_k: int = 10) -> List[Dict]:
         lower = query.lower().strip()
+        if any(phrase in lower for phrase in ["all files", "drive files", "list files", "show files", "what are the files"]):
+            results = self.indexer.list_files()[:top_k]
+            self.memory.add_turn(query, [r["file_id"] for r in results])
+            self.memory.last_results = results
+            return results
+
         if lower.startswith("from these") or lower.startswith("compare") or "across them" in lower:
             base = self.memory.last_results
             if not base:

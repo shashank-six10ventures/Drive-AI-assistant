@@ -168,6 +168,10 @@ with st.sidebar:
         f"Folder ID: `{settings.google_drive_folder_id or 'empty'}` | "
         f"Shared Drive ID: `{settings.google_shared_drive_id or 'empty'}`"
     )
+    st.caption(
+        f"OpenAI key: `{'loaded' if bool(settings.openai_api_key) else 'missing'}` | "
+        f"Drive credentials: `{'loaded' if bool(settings.google_service_account_json or settings.google_service_account_file) else 'missing'}`"
+    )
     if st.button("Run Monitor Once"):
         try:
             with st.spinner("Syncing Drive folder..."):
@@ -266,6 +270,7 @@ if user_query:
 
 st.divider()
 st.subheader("Dataset Details")
+_ensure_demo_data(indexer)
 all_files = indexer.list_files()
 tabular_files = [f for f in all_files if Path(f.get("local_path", "")).suffix.lower() in [".csv", ".xlsx", ".xls"]]
 selected = st.multiselect(
