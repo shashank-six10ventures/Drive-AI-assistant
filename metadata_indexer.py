@@ -172,31 +172,63 @@ class MetadataIndexer:
         return self.list_files()
 
     def insert_record(self, item: Dict) -> None:
-        # Minimal insert wrapper for dummy-data bootstrap.
+        # Create a real local demo file so analytics and previews still work.
         file_name = item.get("file_name", "dummy_file.txt")
         file_id = f"dummy_{Path(file_name).stem.lower().replace(' ', '_')}"
+        file_path = self._write_dummy_file(file_id, file_name)
+        file_bytes = file_path.read_bytes()
         metadata = {
             "file_id": file_id,
             "file_name": file_name,
             "uploader_name": item.get("uploader", "Unknown"),
-            "file_type": "text/csv" if file_name.lower().endswith(".csv") else "application/octet-stream",
+            "file_type": "text/csv" if file_name.lower().endswith(".csv") else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             "modified_time": datetime.utcnow().isoformat() + "Z",
             "file_link": item.get("link", ""),
         }
-        keywords = item.get("keywords", "")
-        keyword_list = [k.strip() for k in keywords.split() if k.strip()]
-        analysis = {
-            "summary": f"Demo dataset: {file_name}",
-            "keywords": keyword_list,
-            "topic": item.get("topic", "general"),
-            "dataset_type": item.get("topic", "general"),
-            "columns": [],
-            "num_rows": 0,
-            "sample_data": [],
-            "text_content": f"{file_name} {keywords} {item.get('topic', '')}",
-        }
-        self.index_file(metadata, analysis, local_path="")
+        analysis = analyze_file(file_name, metadata["file_type"], file_bytes)
+        self.index_file(metadata, analysis, local_path=str(file_path))
         self.update_monitor_state(file_id, metadata["modified_time"])
+
+    def _write_dummy_file(self, file_id: str, file_name: str) -> Path:
+        dummy_dir = CACHE_DIR / "dummy"
+        dummy_dir.mkdir(parents=True, exist_ok=True)
+        file_path = dummy_dir / f"{file_id}_{file_name}"
+
+        if file_name == "sales_2025.xlsx":
+            df = pd.DataFrame(
+                {
+                    "month": ["Jan", "Feb", "Mar", "Apr"],
+                    "revenue": [120000, 135000, 142000, 150000],
+                    "sales": [320, 350, 372, 395],
+                }
+            )
+            df.to_excel(file_path, index=False)
+            return file_path
+
+        if file_name == "profit_analysis.xlsx":
+            df = pd.DataFrame(
+                {
+                    "quarter": ["Q1", "Q2", "Q3", "Q4"],
+                    "profit": [22000, 26000, 25000, 31000],
+                    "margin": [0.18, 0.20, 0.19, 0.22],
+                }
+            )
+            df.to_excel(file_path, index=False)
+            return file_path
+
+        if file_name == "marketing_data.csv":
+            df = pd.DataFrame(
+                {
+                    "campaign": ["Launch A", "Launch B", "Festival Push", "Retargeting"],
+                    "leads": [540, 620, 710, 480],
+                    "spend": [12000, 15000, 18000, 9000],
+                }
+            )
+            df.to_csv(file_path, index=False)
+            return file_path
+
+        file_path.write_text("demo file", encoding="utf-8")
+        return file_path
 
     def get_file(self, file_id: str) -> Optional[Dict]:
         row = self.conn.execute("SELECT * FROM files WHERE file_id = ?", (file_id,)).fetchone()
