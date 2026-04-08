@@ -16,13 +16,28 @@ CACHE_DIR = DATA_DIR / "cache"
 EXPORT_DIR = DATA_DIR / "exports"
 DB_PATH = DATA_DIR / "drive_assistant.db"
 
+def _search_secret_mapping(mapping: Mapping, target_key: str):
+    for key, value in mapping.items():
+        if key == target_key:
+            return value
+        if isinstance(value, Mapping):
+            nested = _search_secret_mapping(value, target_key)
+            if nested not in [None, ""]:
+                return nested
+    return None
+
+
 def _get_setting(name: str, default: str = "") -> str:
     env_value = os.getenv(name)
     if env_value not in [None, ""]:
         return env_value
     if st is not None:
         try:
-            secret_value = st.secrets.get(name, default)
+            secret_value = st.secrets.get(name)
+            if secret_value in [None, ""]:
+                secret_value = _search_secret_mapping(st.secrets, name)
+            if secret_value in [None, ""]:
+                secret_value = default
             if isinstance(secret_value, Mapping):
                 return json.dumps(dict(secret_value))
             if isinstance(secret_value, list):
@@ -66,12 +81,17 @@ class Settings:
     ai_provider: str = _get_setting("AI_PROVIDER", "openai").lower()
     openai_api_key: str = _get_setting("OPENAI_API_KEY", "")
     openai_model: str = _get_setting("OPENAI_MODEL", "gpt-4o-mini")
+    anthropic_api_key: str = _get_setting("ANTHROPIC_API_KEY", _get_setting("CLAUDE_API_KEY", ""))
+    anthropic_model: str = _get_setting("ANTHROPIC_MODEL", "claude-3-5-sonnet-20241022")
     groq_api_key: str = _get_setting("GROQ_API_KEY", "")
     groq_model: str = _get_setting("GROQ_MODEL", "llama-3.1-8b-instant")
     gemini_api_key: str = _get_setting("GEMINI_API_KEY", "")
     gemini_model: str = _get_setting("GEMINI_MODEL", "gemini-1.5-flash")
     huggingface_api_key: str = _get_setting("HUGGINGFACE_API_KEY", "")
     huggingface_model: str = _get_setting("HUGGINGFACE_MODEL", "google/flan-t5-large")
+    tavily_api_key: str = _get_setting("TAVILY_API_KEY", "")
+    amazon_marketplace: str = _get_setting("AMAZON_MARKETPLACE", "amazon.in")
+    business_role: str = _get_setting("BUSINESS_ROLE", "leadership")
 
     embedding_model: str = _get_setting("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
     max_text_chars: int = _as_int("MAX_TEXT_CHARS", 20000)

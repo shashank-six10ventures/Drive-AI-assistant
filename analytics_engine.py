@@ -95,6 +95,109 @@ class AnalyticsEngine:
         fig.update_layout(barmode="group", title="Cross-file Comparison")
         return fig
 
+    def combine_datasets(self, datasets: List[Dict]) -> pd.DataFrame:
+        frames = []
+        for item in datasets:
+            df = item["df"].copy()
+            df["source_file"] = item["file_name"]
+            frames.append(df)
+        if not frames:
+            return pd.DataFrame()
+        return pd.concat(frames, ignore_index=True, sort=False)
+
+    def build_kpi_snapshot(self, df: pd.DataFrame, metric_hints: Optional[List[str]] = None) -> Dict:
+        metric_col = self.find_best_column(df, metric_hints or ["revenue", "sales", "profit", "price"])
+        snapshot = {
+            "rows": int(len(df)),
+            "columns": int(len(df.columns)),
+            "metric_column": metric_col,
+        }
+        if not metric_col:
+            return snapshot
+        snapshot["total"] = float(df[metric_col].sum())
+        snapshot["average"] = float(df[metric_col].mean())
+        snapshot["max"] = float(df[metric_col].max())
+        snapshot["min"] = float(df[metric_col].min())
+        return snapshot
+
+    def business_alerts(self, datasets: List[Dict], metric_hints: Optional[List[str]] = None) -> List[Dict]:
+        alerts = []
+        for item in datasets:
+            df = item["df"]
+            metric_col = self.find_best_column(df, metric_hints or ["revenue", "sales", "profit", "price"])
+            if not metric_col:
+                continue
+            anomalies = self.detect_anomalies(df, metric_col)
+            if anomalies["count"] > 0:
+                alerts.append(
+                    {
+                        "file_name": item["file_name"],
+                        "severity": "high" if anomalies["count"] >= 3 else "medium",
+                        "message": f"{anomalies['count']} anomaly rows detected in `{metric_col}`.",
+                    }
+                )
+            if len(df) > 1:
+                latest = df[metric_col].iloc[-1]
+                baseline = df[metric_col].iloc[0]
+                if baseline not in [0, None]:
+                    change_pct = ((latest - baseline) / baseline) * 100
+                    if abs(change_pct) >= 15:
+                        direction = "up" if change_pct > 0 else "down"
+                        alerts.append(
+                            {
+                                "file_name": item["file_name"],
+                                "severity": "medium",
+                                "message": f"{metric_col} moved {direction} {abs(change_pct):.1f}% across the visible period.",
+                            }
+                        )
+        return alerts
+
+    def executive_brief(self, datasets: List[Dict], metric_hints: Optional[List[str]] = None) -> Dict:
+        headlines = []
+        kpis = []
+        for item in datasets:
+            df = item["df"]
+            metric_col = self.find_best_column(df, metric_hints or ["revenue", "sales", "profit", "price"])
+            if not metric_col:
+                continue
+            snapshot = self.build_kpi_snapshot(df, metric_hints)
+            snapshot["file_name"] = item["file_name"]
+            kpis.append(snapshot)
+            headlines.append(
+                f"{item['file_name']}: total {metric_col} {snapshot.get('total', 0):,.2f}, "
+                f"average {snapshot.get('average', 0):,.2f}."
+            )
+        return {
+            "headlines": headlines[:5],
+            "alerts": self.business_alerts(datasets, metric_hints)[:5],
+            "kpis": kpis,
+        }
+
+    def compare_dataset_to_market(self, df: pd.DataFrame, external_rows: List[Dict], metric_hints: Optional[List[str]] = None) -> pd.DataFrame:
+        metric_col = self.find_best_column(df, metric_hints or ["price", "revenue", "sales", "profit"])
+        if not metric_col or not external_rows:
+            return pd.DataFrame()
+
+        internal_average = float(df[metric_col].mean())
+        comparison_rows = []
+        for row in external_rows:
+            raw_price = str(row.get("price", "")).replace(",", "").strip()
+            try:
+                market_price = float(raw_price)
+            except ValueError:
+                continue
+            comparison_rows.append(
+                {
+                    "market_item": row.get("title", "Unknown"),
+                    "market_price": market_price,
+                    "internal_average": internal_average,
+                    "price_gap": market_price - internal_average,
+                    "source": row.get("source", "market"),
+                    "url": row.get("url", ""),
+                }
+            )
+        return pd.DataFrame(comparison_rows)
+
     def trend_chart(
         self, df: pd.DataFrame, date_col: Optional[str] = None, value_col: Optional[str] = None
     ):

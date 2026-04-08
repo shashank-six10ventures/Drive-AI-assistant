@@ -1,6 +1,6 @@
 # Drive AI Assistant
 
-Production-ready AI-powered system for Google Drive monitoring, intelligent file analysis, semantic retrieval, conversational follow-up, analytics, and Streamlit dashboards.
+Production-ready AI-powered system for Google Drive monitoring, intelligent file analysis, semantic retrieval, conversational follow-up, analytics, file-renaming workflows, Amazon comparisons, and Streamlit dashboards.
 
 ## Implemented Modules
 
@@ -9,8 +9,8 @@ Production-ready AI-powered system for Google Drive monitoring, intelligent file
 - `metadata_indexer.py`: SQLite metadata store plus sentence-transformers embeddings.
 - `semantic_search.py`: natural-language search with metadata filters and conversation memory for follow-up queries.
 - `analytics_engine.py`: pandas analysis, trend/comparison charts, insights, and Excel export.
-- `ai_router.py`: provider switch for OpenAI, Groq, Gemini, HuggingFace.
-- `streamlit_app.py`: end-to-end dashboard for sync, search, summaries, analytics, and downloads.
+- `ai_router.py`: provider switch for Anthropic Claude, OpenAI, Groq, Gemini, HuggingFace, plus Amazon/web comparison hooks.
+- `streamlit_app.py`: end-to-end dashboard for sync, search, summaries, analytics, basket workflows, renaming, and downloads.
 - `config.py`: environment-based configuration and path setup.
 
 ## Project Structure
@@ -63,11 +63,21 @@ SMTP_PASSWORD=your_password_or_app_password
 EMAIL_FROM=your_email
 EMAIL_TO=target_email
 
-AI_PROVIDER=openai
+AI_PROVIDER=anthropic
+ANTHROPIC_API_KEY=...
 OPENAI_API_KEY=...
 GROQ_API_KEY=...
 GEMINI_API_KEY=...
 HUGGINGFACE_API_KEY=...
+AMAZON_MARKETPLACE=amazon.in
+BUSINESS_ROLE=leadership
+```
+
+If you mainly use Claude, set:
+
+```bash
+AI_PROVIDER=anthropic
+ANTHROPIC_API_KEY=your_claude_api_key
 ```
 
 ## Google Drive Access
@@ -80,7 +90,8 @@ HUGGINGFACE_API_KEY=...
 1. Create a Service Account and download JSON key.
 2. Put the file in project root as `credentials.json` (or set `GOOGLE_SERVICE_ACCOUNT_FILE` to full path).
 3. Share your target Drive folder or the whole Shared Drive with the service account email.
-4. Set `GOOGLE_DRIVE_AUTH_MODE=service_account`.
+4. If you want the app to rename files from Streamlit, give the service account `Editor` or `Content manager` access. `Viewer` is enough for read/search/download only.
+5. Set `GOOGLE_DRIVE_AUTH_MODE=service_account`.
 
 ### Shared Drive scan modes
 
@@ -118,6 +129,33 @@ UI shows one of:
 - `Using demo data`
 
 If a file has no Drive URL (demo/local), UI shows `Local/demo file (no Drive link)`.
+
+## LLM Cost Control
+
+The sidebar now includes:
+
+- `Enable paid LLM`: turns Claude/OpenAI/Groq/Gemini/HuggingFace calls on or off
+- `LLM provider`: lets you switch providers without changing code
+
+When LLM mode is off:
+
+- retrieval, folder/file search, rename preview, combine/export, dashboard metrics, downloads, and alerts still work
+- intent routing uses rule-based logic
+- summaries, briefs, and dataset commentary use deterministic fallback text
+
+This is the recommended default mode if you want to keep API costs controlled.
+
+## Business Workflows
+
+The app now supports:
+
+- folder-aware search such as `show folders available` and `show contents of folder finance`
+- selected-item basket for combining files and building dashboards
+- executive briefs and business alerts from selected tabular datasets
+- filename cleanup preview via prompts like `clean naming in folder finance`
+- Drive rename apply via prompts like `apply rename in folder finance`
+- Amazon marketplace comparison via prompts like `compare this dataset with Amazon`
+- direct browser download buttons for any indexed file with a local cached copy
 
 ## Run
 
@@ -164,25 +202,29 @@ This flow performs:
 ### Recommended Streamlit secrets for service account deployment
 
 Do not upload `credentials.json` to GitHub.  
-Instead, paste the JSON into Streamlit secrets like this:
+Instead, paste the JSON into Streamlit secrets like this.
+
+Important: keep `AI_PROVIDER` and `OPENAI_API_KEY` above the `[GOOGLE_SERVICE_ACCOUNT_JSON]` section so they stay top-level in TOML.
 
 ```toml
 GOOGLE_DRIVE_AUTH_MODE = "service_account"
-GOOGLE_SHARED_DRIVE_ID = "your_shared_drive_id"
-DRIVE_FOLDER_ID = ""
-GOOGLE_SERVICE_ACCOUNT_JSON = """
-{
-  "type": "service_account",
-  "project_id": "...",
-  "private_key_id": "...",
-  "private_key": "-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n",
-  "client_email": "...",
-  "client_id": "...",
-  "token_uri": "https://oauth2.googleapis.com/token"
-}
+AI_PROVIDER = "anthropic"
+ANTHROPIC_API_KEY = "your_claude_key"
+OPENAI_API_KEY = "your_openai_key_if_needed"
+DRIVE_FOLDER_ID = "your_folder_id"
+GOOGLE_SHARED_DRIVE_ID = ""
+
+[GOOGLE_SERVICE_ACCOUNT_JSON]
+type = "service_account"
+project_id = "..."
+private_key_id = "..."
+private_key = """-----BEGIN PRIVATE KEY-----
+...
+-----END PRIVATE KEY-----
 """
-AI_PROVIDER = "openai"
-OPENAI_API_KEY = "your_openai_key"
+client_email = "..."
+client_id = "..."
+token_uri = "https://oauth2.googleapis.com/token"
 ```
 
 If you want to scan just one folder inside the Shared Drive:
@@ -198,3 +240,5 @@ GOOGLE_SHARED_DRIVE_ID = "your_shared_drive_id"
 - Downloaded Drive files are cached under `data/cache/`.
 - Exported analytics reports are generated under `data/exports/`.
 - OAuth token file is saved at `token.json` (or `GOOGLE_OAUTH_TOKEN_FILE`).
+- Amazon comparison uses best-effort marketplace parsing and may fail if Amazon blocks automated requests; the app falls back gracefully.
+- If you use Claude, the simplest deployment path is `AI_PROVIDER=anthropic` plus `ANTHROPIC_API_KEY`, then leave `Enable paid LLM` off until you specifically need narrative summaries.

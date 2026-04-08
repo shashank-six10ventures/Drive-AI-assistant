@@ -25,7 +25,7 @@ from metadata_indexer import MetadataIndexer
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
-SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
+SCOPES = ["https://www.googleapis.com/auth/drive"]
 
 GOOGLE_EXPORT_MAP = {
     "application/vnd.google-apps.spreadsheet": (
@@ -107,7 +107,7 @@ class DriveMonitor:
             "supportsAllDrives": True,
             "includeItemsFromAllDrives": True,
             "fields": (
-                "nextPageToken,files(id,name,mimeType,modifiedTime,webViewLink,owners(displayName),"
+                "nextPageToken,files(id,name,mimeType,modifiedTime,webViewLink,parents,owners(displayName),"
                 "lastModifyingUser(displayName))"
             ),
             "pageSize": 1000,
@@ -129,6 +129,39 @@ class DriveMonitor:
                 break
         return all_files
 
+    def _list_tree_items(self, root_folder_id: str) -> List[Dict]:
+        seen_ids = set()
+        ordered_items: List[Dict] = []
+        pending_folders = [root_folder_id]
+
+        while pending_folders:
+            current_folder_id = pending_folders.pop(0)
+            for item in self._list_files(current_folder_id):
+                if item["id"] in seen_ids:
+                    continue
+                seen_ids.add(item["id"])
+                ordered_items.append(item)
+                if item.get("mimeType") == "application/vnd.google-apps.folder":
+                    pending_folders.append(item["id"])
+        return ordered_items
+
+    def _build_path_lookup(self, root_folder_id: str, raw_items: List[Dict]) -> Dict[str, str]:
+        path_lookup: Dict[str, str] = {}
+        children_by_parent: Dict[str, List[Dict]] = {}
+        for item in raw_items:
+            for parent_id in item.get("parents", []):
+                children_by_parent.setdefault(parent_id, []).append(item)
+
+        queue: List[Tuple[str, str]] = [(root_folder_id, "")]
+        while queue:
+            current_parent_id, current_path = queue.pop(0)
+            for child in sorted(children_by_parent.get(current_parent_id, []), key=lambda row: row.get("name", "").lower()):
+                child_path = f"{current_path}/{child['name']}".strip("/")
+                path_lookup[child["id"]] = child_path
+                if child.get("mimeType") == "application/vnd.google-apps.folder":
+                    queue.append((child["id"], child_path))
+        return path_lookup
+
     def get_drive_files(self, folder_id: str | None = None) -> List[Dict]:
         """
         Fetch normalized metadata for all files inside the given Drive folder,
@@ -141,7 +174,11 @@ class DriveMonitor:
         - file_link
         - uploader_name
         """
-        raw_files = self._list_files(folder_id)
+        raw_files = self._list_tree_items(folder_id) if folder_id else self._list_files(folder_id)
+        if folder_id:
+            path_lookup = self._build_path_lookup(folder_id, raw_files)
+            for raw in raw_files:
+                raw["pathText"] = path_lookup.get(raw["id"], raw.get("name", ""))
         return [self.extract_file_metadata(f) for f in raw_files]
 
     def _download_file_bytes(self, file_id: str, file_name: str, mime_type: str) -> Tuple[bytes, str, str]:
@@ -206,17 +243,82 @@ class DriveMonitor:
             "file_id": f["id"],
             "file_name": f["name"],
             "uploader_name": uploader,
+            "item_kind": "folder" if f.get("mimeType") == "application/vnd.google-apps.folder" else "file",
             "file_type": f["mimeType"],
             "modified_time": f["modifiedTime"],
             "file_link": f.get("webViewLink", ""),
+            "parent_ids": f.get("parents", []),
+            "path_text": f.get("pathText", f.get("name", "")),
         }
+
+    def suggest_clean_name(self, original_name: str, item_kind: str = "file") -> str:
+        suffix = ""
+        stem = original_name
+        if item_kind == "file":
+            suffix = Path(original_name).suffix
+            stem = Path(original_name).stem
+
+        stem = stem.replace("_", " ").replace("-", " ")
+        stem = re.sub(r"\s+", " ", stem).strip()
+        stem = re.sub(r"[^\w\s().,&]", "", stem)
+        words = []
+        for word in stem.split():
+            if word.isupper() or word.isdigit():
+                words.append(word)
+            elif len(word) <= 3 and word.lower() in {"sku", "api", "pdf", "csv", "pnl"}:
+                words.append(word.upper())
+            else:
+                words.append(word.capitalize())
+        cleaned = " ".join(words).strip(" ._")
+        cleaned = re.sub(r"\s+", " ", cleaned)
+        return f"{cleaned}{suffix}" if cleaned else original_name
+
+    def preview_clean_names(self, items: List[Dict]) -> List[Dict]:
+        preview = []
+        for item in items:
+            current_name = item.get("file_name") or item.get("name", "")
+            suggested_name = self.suggest_clean_name(current_name, item.get("item_kind", "file"))
+            preview.append(
+                {
+                    "file_id": item["file_id"],
+                    "current_name": current_name,
+                    "suggested_name": suggested_name,
+                    "item_kind": item.get("item_kind", "file"),
+                    "path_text": item.get("path_text", ""),
+                    "will_change": current_name != suggested_name,
+                }
+            )
+        return preview
+
+    def rename_drive_item(self, file_id: str, new_name: str) -> Dict:
+        updated = (
+            self.drive.files()
+            .update(fileId=file_id, body={"name": new_name}, supportsAllDrives=True, fields="id,name,modifiedTime")
+            .execute()
+        )
+        return updated
+
+    def apply_rename_plan(self, rename_plan: List[Dict]) -> List[Dict]:
+        applied = []
+        for item in rename_plan:
+            if not item.get("will_change"):
+                continue
+            try:
+                updated = self.rename_drive_item(item["file_id"], item["suggested_name"])
+                applied.append(updated)
+            except Exception as exc:
+                logging.warning("Failed to rename %s: %s", item["file_id"], exc)
+        return applied
 
     def run_once(self) -> Dict[str, List[str]]:
         folder_id = settings.google_drive_folder_id
         if not folder_id and not settings.google_shared_drive_id:
             raise ValueError("Set DRIVE_FOLDER_ID for folder mode or GOOGLE_SHARED_DRIVE_ID for whole shared drive mode.")
 
-        remote_files = self._list_files(folder_id)
+        remote_files = self._list_tree_items(folder_id) if folder_id else self._list_files(None)
+        path_lookup = self._build_path_lookup(folder_id, remote_files) if folder_id else {}
+        for raw in remote_files:
+            raw["pathText"] = path_lookup.get(raw["id"], raw.get("name", ""))
         remote_by_id = {f["id"]: f for f in remote_files}
         prior = self.indexer.get_monitor_state()
         current = {f["id"]: f["modifiedTime"] for f in remote_files}
@@ -229,6 +331,20 @@ class DriveMonitor:
             raw = remote_by_id[fid]
             metadata = self.extract_file_metadata(raw)
             try:
+                if metadata["item_kind"] == "folder":
+                    analysis = {
+                        "summary": f"Drive folder: {metadata['file_name']}",
+                        "keywords": ["folder"],
+                        "topic": "folder",
+                        "dataset_type": "folder",
+                        "columns": [],
+                        "num_rows": 0,
+                        "sample_data": [],
+                        "text_content": metadata["file_name"],
+                    }
+                    self.indexer.index_file(metadata, analysis, local_path="")
+                    self.indexer.update_monitor_state(fid, metadata["modified_time"])
+                    continue
                 file_bytes, resolved_name, resolved_mime = self._download_file_bytes(
                     file_id=fid, file_name=metadata["file_name"], mime_type=metadata["file_type"]
                 )

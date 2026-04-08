@@ -49,9 +49,12 @@ class MetadataIndexer:
                 file_id TEXT PRIMARY KEY,
                 file_name TEXT,
                 uploader_name TEXT,
+                item_kind TEXT DEFAULT 'file',
                 file_type TEXT,
                 modified_time TEXT,
                 file_link TEXT,
+                parent_ids_json TEXT DEFAULT '[]',
+                path_text TEXT DEFAULT '',
                 summary TEXT,
                 keywords TEXT,
                 topic TEXT,
@@ -66,6 +69,9 @@ class MetadataIndexer:
             )
             """
         )
+        self._ensure_column("files", "item_kind", "TEXT DEFAULT 'file'")
+        self._ensure_column("files", "parent_ids_json", "TEXT DEFAULT '[]'")
+        self._ensure_column("files", "path_text", "TEXT DEFAULT ''")
         self.conn.execute(
             """
             CREATE TABLE IF NOT EXISTS monitor_state (
@@ -77,7 +83,14 @@ class MetadataIndexer:
         )
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_files_uploader ON files(uploader_name)")
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_files_modified ON files(modified_time)")
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_files_item_kind ON files(item_kind)")
         self.conn.commit()
+
+    def _ensure_column(self, table_name: str, column_name: str, column_definition: str) -> None:
+        columns = [row["name"] for row in self.conn.execute(f"PRAGMA table_info({table_name})").fetchall()]
+        if column_name not in columns:
+            self.conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_definition}")
+            self.conn.commit()
 
     def index_file(self, metadata: Dict, analysis: Dict, local_path: str) -> None:
         combined_text = " ".join(
@@ -92,17 +105,21 @@ class MetadataIndexer:
         self.conn.execute(
             """
             INSERT INTO files (
-                file_id, file_name, uploader_name, file_type, modified_time, file_link,
+                file_id, file_name, uploader_name, item_kind, file_type, modified_time, file_link,
+                parent_ids_json, path_text,
                 summary, keywords, topic, dataset_type, columns_json, num_rows,
                 sample_data_json, text_content, local_path, embedding_json, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(file_id) DO UPDATE SET
                 file_name=excluded.file_name,
                 uploader_name=excluded.uploader_name,
+                item_kind=excluded.item_kind,
                 file_type=excluded.file_type,
                 modified_time=excluded.modified_time,
                 file_link=excluded.file_link,
+                parent_ids_json=excluded.parent_ids_json,
+                path_text=excluded.path_text,
                 summary=excluded.summary,
                 keywords=excluded.keywords,
                 topic=excluded.topic,
@@ -119,9 +136,12 @@ class MetadataIndexer:
                 metadata["file_id"],
                 metadata.get("file_name", ""),
                 metadata.get("uploader_name", ""),
+                metadata.get("item_kind", "file"),
                 metadata.get("file_type", ""),
                 metadata.get("modified_time", ""),
                 metadata.get("file_link", ""),
+                json.dumps(metadata.get("parent_ids", [])),
+                metadata.get("path_text", ""),
                 analysis.get("summary", ""),
                 json.dumps(analysis.get("keywords", [])),
                 analysis.get("topic", "general"),
@@ -167,24 +187,118 @@ class MetadataIndexer:
         rows = self.conn.execute("SELECT * FROM files ORDER BY updated_at DESC").fetchall()
         return [dict(row) for row in rows]
 
+    def list_items(self, item_kind: str | None = None) -> List[Dict]:
+        if item_kind:
+            rows = self.conn.execute(
+                "SELECT * FROM files WHERE item_kind = ? ORDER BY updated_at DESC",
+                (item_kind,),
+            ).fetchall()
+        else:
+            rows = self.conn.execute("SELECT * FROM files ORDER BY updated_at DESC").fetchall()
+        return [dict(row) for row in rows]
+
+    def search_by_name(self, name_query: str, item_kind: str | None = None, limit: int = 25) -> List[Dict]:
+        tokens = [token.strip().lower() for token in name_query.split() if token.strip()]
+        rows = self.list_items(item_kind)
+        ranked = []
+        for row in rows:
+            haystack = " ".join(
+                [
+                    row.get("file_name", ""),
+                    row.get("path_text", ""),
+                    row.get("summary", ""),
+                ]
+            ).lower()
+            score = sum(1 for token in tokens if token in haystack)
+            if score > 0:
+                ranked.append((score, row))
+        ranked.sort(key=lambda item: (item[0], item[1].get("updated_at", "")), reverse=True)
+        return [row for _, row in ranked[:limit]]
+
+    def list_children(self, parent_id: str, item_kind: str | None = None) -> List[Dict]:
+        rows = self.list_items(item_kind)
+        children = []
+        for row in rows:
+            parent_ids = json.loads(row.get("parent_ids_json", "[]") or "[]")
+            if parent_id in parent_ids:
+                children.append(row)
+        return sorted(
+            children,
+            key=lambda item: (0 if item.get("item_kind") == "folder" else 1, item.get("file_name", "").lower()),
+        )
+
+    def folder_overview(self, folder_id: str) -> Dict:
+        folder = self.get_file(folder_id)
+        children = self.list_children(folder_id)
+        child_files = [item for item in children if item.get("item_kind") == "file"]
+        child_folders = [item for item in children if item.get("item_kind") == "folder"]
+        return {
+            "folder": folder,
+            "children": children,
+            "file_count": len(child_files),
+            "folder_count": len(child_folders),
+        }
+
+    def get_descendants(self, folder_id: str, include_folders: bool = True) -> List[Dict]:
+        descendants = []
+        pending = [folder_id]
+        seen = set()
+        while pending:
+            current = pending.pop(0)
+            for child in self.list_children(current):
+                if child["file_id"] in seen:
+                    continue
+                seen.add(child["file_id"])
+                if include_folders or child.get("item_kind") == "file":
+                    descendants.append(child)
+                if child.get("item_kind") == "folder":
+                    pending.append(child["file_id"])
+        return descendants
+
     def get_all_records(self) -> List[Dict]:
         # Compatibility helper used by seed logic.
         return self.list_files()
 
     def insert_record(self, item: Dict) -> None:
-        # Create a real local demo file so analytics and previews still work.
+        item_kind = item.get("item_kind", "file")
         file_name = item.get("file_name", "dummy_file.txt")
         file_id = f"dummy_{Path(file_name).stem.lower().replace(' ', '_')}"
-        file_path = self._write_dummy_file(file_id, file_name)
-        file_bytes = file_path.read_bytes()
+        parent_ids = item.get("parent_ids", [])
+        parent_label = ""
+        if parent_ids:
+            parent_label = parent_ids[0].replace("dummy_", "").replace("_", " ").title()
         metadata = {
             "file_id": file_id,
             "file_name": file_name,
             "uploader_name": item.get("uploader", "Unknown"),
-            "file_type": "text/csv" if file_name.lower().endswith(".csv") else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "item_kind": item_kind,
+            "file_type": item.get(
+                "file_type",
+                "text/csv" if file_name.lower().endswith(".csv") else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            ),
             "modified_time": datetime.utcnow().isoformat() + "Z",
             "file_link": item.get("link", ""),
+            "parent_ids": parent_ids,
+            "path_text": f"{parent_label}/{file_name}".strip("/") if parent_label else file_name,
         }
+        if item_kind == "folder":
+            analysis = {
+                "summary": f"Folder in Drive: {file_name}",
+                "keywords": [item.get("topic", "folder")],
+                "topic": item.get("topic", "folder"),
+                "dataset_type": "folder",
+                "columns": [],
+                "num_rows": 0,
+                "sample_data": [],
+                "text_content": f"Folder {file_name}",
+            }
+            self.index_file(metadata, analysis, local_path="")
+            self.update_monitor_state(file_id, metadata["modified_time"])
+            return
+
+        # Create a real local demo file so analytics and previews still work.
+        file_path = self._write_dummy_file(file_id, file_name)
+        file_bytes = file_path.read_bytes()
         analysis = analyze_file(file_name, metadata["file_type"], file_bytes)
         self.index_file(metadata, analysis, local_path=str(file_path))
         self.update_monitor_state(file_id, metadata["modified_time"])
@@ -277,7 +391,12 @@ class MetadataIndexer:
         ).fetchall()
         if not dummy_rows:
             seeded = self.seed_dummy_data_if_empty()
-            return 3 if seeded else 0
+            if not seeded:
+                return 0
+            row = self.conn.execute(
+                "SELECT COUNT(*) AS c FROM files WHERE file_id LIKE 'dummy_%'"
+            ).fetchone()
+            return int(row["c"])
 
         valid_local_files = 0
         for row in dummy_rows:
@@ -359,11 +478,28 @@ class MetadataIndexer:
 
         dummy_data = [
             {
+                "file_name": "Marketing",
+                "uploader": "Madhav",
+                "keywords": "marketing folder campaign",
+                "topic": "folder",
+                "link": "",
+                "item_kind": "folder",
+            },
+            {
+                "file_name": "Finance",
+                "uploader": "Neel",
+                "keywords": "finance folder profit",
+                "topic": "folder",
+                "link": "",
+                "item_kind": "folder",
+            },
+            {
                 "file_name": "sales_2025.xlsx",
                 "uploader": "Amber",
                 "keywords": "sales revenue",
                 "topic": "sales",
                 "link": "",
+                "parent_ids": ["dummy_finance"],
             },
             {
                 "file_name": "profit_analysis.xlsx",
@@ -371,6 +507,7 @@ class MetadataIndexer:
                 "keywords": "profit finance",
                 "topic": "finance",
                 "link": "",
+                "parent_ids": ["dummy_finance"],
             },
             {
                 "file_name": "marketing_data.csv",
@@ -378,6 +515,7 @@ class MetadataIndexer:
                 "keywords": "marketing campaign",
                 "topic": "marketing",
                 "link": "",
+                "parent_ids": ["dummy_marketing"],
             },
         ]
 
