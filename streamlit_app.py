@@ -55,7 +55,7 @@ def bootstrap_data_source(indexer: MetadataIndexer) -> None:
             source = "google_drive"
             detail = f"Using Google Drive data ({real_count} files indexed)."
         else:
-            seeded = indexer.seed_dummy_data_if_empty()
+            seeded = indexer.ensure_dummy_data_ready()
             source = "demo"
             detail = (
                 "Drive folder is empty. Using demo data."
@@ -63,7 +63,7 @@ def bootstrap_data_source(indexer: MetadataIndexer) -> None:
                 else "Drive folder is empty. No records available."
             )
     except Exception as exc:
-        seeded = indexer.seed_dummy_data_if_empty()
+        seeded = indexer.ensure_dummy_data_ready()
         source = "demo"
         detail = (
             f"Drive unavailable ({exc}). Using demo data."
@@ -150,6 +150,11 @@ bootstrap_data_source(indexer)
 with st.sidebar:
     st.subheader("Drive Sync")
     st.write(f"Provider: `{settings.ai_provider}`")
+    st.caption(
+        f"Auth mode: `{settings.drive_auth_mode}` | "
+        f"Folder ID: `{settings.google_drive_folder_id or 'empty'}` | "
+        f"Shared Drive ID: `{settings.google_shared_drive_id or 'empty'}`"
+    )
     if st.button("Run Monitor Once"):
         try:
             with st.spinner("Syncing Drive folder..."):
@@ -164,8 +169,7 @@ with st.sidebar:
                 st.session_state["data_source_detail"] = "Using Google Drive data."
         except Exception as exc:
             st.error(f"Drive sync failed: {exc}")
-            if indexer.count_files() == 0:
-                indexer.seed_dummy_data_if_empty()
+            indexer.ensure_dummy_data_ready()
             st.session_state["data_source"] = "demo"
             st.session_state["data_source_detail"] = f"Drive sync failed ({exc}). Using demo data."
 
