@@ -875,7 +875,6 @@ def _render_dataset_dashboard(
             st.caption(f"Preview table aggregated by `{preview_label}` using `{agg}`.")
             st.dataframe(grouped_preview.head(20), use_container_width=True)
 
-        figures = analytics.dashboard_figures(
         panels = analytics.dashboard_panels(
             df=df,
             metrics=selected_metrics,
