@@ -15,6 +15,7 @@ DATA_DIR = BASE_DIR / "data"
 CACHE_DIR = DATA_DIR / "cache"
 EXPORT_DIR = DATA_DIR / "exports"
 DB_PATH = DATA_DIR / "drive_assistant.db"
+DASHBOARD_PRESETS_PATH = DATA_DIR / "dashboard_presets.json"
 
 def _search_secret_mapping(mapping: Mapping, target_key: str):
     for key, value in mapping.items():

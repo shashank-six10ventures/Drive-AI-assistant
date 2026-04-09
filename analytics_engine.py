@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Dict, List, Optional
 
+import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
@@ -42,6 +43,37 @@ class AnalyticsEngine:
             "columns": [str(c) for c in df.columns],
             "numeric_columns": numeric_cols,
             "sample": df.head(5).to_dict(orient="records"),
+        }
+
+    def dataset_profile(self, df: pd.DataFrame) -> Dict:
+        numeric_cols = [str(col) for col in df.select_dtypes(include="number").columns.tolist()]
+        categorical_cols = [str(col) for col in df.columns if str(col) not in numeric_cols]
+        datetime_cols = []
+        for col in df.columns:
+            col_name = str(col)
+            if "date" in col_name.lower() or "month" in col_name.lower() or "year" in col_name.lower():
+                datetime_cols.append(col_name)
+                continue
+            try:
+                converted = pd.to_datetime(df[col], errors="coerce")
+                if converted.notna().mean() > 0.7:
+                    datetime_cols.append(col_name)
+            except Exception:
+                continue
+        datetime_cols = list(dict.fromkeys(datetime_cols))
+        categorical_cols = [col for col in categorical_cols if col not in datetime_cols]
+        metric_suggestions = [
+            col
+            for col in numeric_cols
+            if any(token in col.lower() for token in ["revenue", "sales", "profit", "price", "cost", "qty", "amount"])
+        ] or numeric_cols[:4]
+        return {
+            "row_count": int(len(df)),
+            "column_count": int(len(df.columns)),
+            "numeric_columns": numeric_cols,
+            "categorical_columns": categorical_cols,
+            "datetime_columns": datetime_cols,
+            "metric_suggestions": metric_suggestions,
         }
 
     def find_best_column(self, df: pd.DataFrame, hints: Optional[List[str]] = None) -> Optional[str]:
@@ -86,6 +118,41 @@ class AnalyticsEngine:
             )
         return pd.DataFrame(rows)
 
+    def common_numeric_columns(self, datasets: List[Dict]) -> List[str]:
+        if not datasets:
+            return []
+        numeric_sets = []
+        for item in datasets:
+            numeric_sets.append(set(item["df"].select_dtypes(include="number").columns.tolist()))
+        common = set.intersection(*numeric_sets) if numeric_sets else set()
+        return sorted([str(col) for col in common])
+
+    def compare_metrics_across_files(self, datasets: List[Dict], metrics: List[str], agg: str = "sum") -> pd.DataFrame:
+        rows = []
+        for item in datasets:
+            df = item["df"]
+            record = {"file_name": item["file_name"]}
+            for metric in metrics:
+                if metric not in df.columns or not pd.api.types.is_numeric_dtype(df[metric]):
+                    continue
+                series = df[metric].dropna()
+                if series.empty:
+                    continue
+                if agg == "mean":
+                    record[metric] = float(series.mean())
+                elif agg == "median":
+                    record[metric] = float(series.median())
+                elif agg == "min":
+                    record[metric] = float(series.min())
+                elif agg == "max":
+                    record[metric] = float(series.max())
+                elif agg == "count":
+                    record[metric] = float(series.count())
+                else:
+                    record[metric] = float(series.sum())
+            rows.append(record)
+        return pd.DataFrame(rows)
+
     def compare_chart(self, compare_df: pd.DataFrame):
         if compare_df.empty:
             return None
@@ -119,6 +186,182 @@ class AnalyticsEngine:
         snapshot["max"] = float(df[metric_col].max())
         snapshot["min"] = float(df[metric_col].min())
         return snapshot
+
+    def metric_kpis(self, df: pd.DataFrame, metric_cols: List[str]) -> List[Dict]:
+        kpis = []
+        for metric in metric_cols:
+            if metric not in df.columns or not pd.api.types.is_numeric_dtype(df[metric]):
+                continue
+            series = df[metric].dropna()
+            if series.empty:
+                continue
+            kpis.append(
+                {
+                    "metric": metric,
+                    "sum": float(series.sum()),
+                    "average": float(series.mean()),
+                    "median": float(series.median()),
+                    "min": float(series.min()),
+                    "max": float(series.max()),
+                }
+            )
+        return kpis
+
+    def aggregate_metrics(
+        self,
+        df: pd.DataFrame,
+        metrics: List[str],
+        group_col: Optional[str] = None,
+        agg: str = "sum",
+    ) -> pd.DataFrame:
+        valid_metrics = [metric for metric in metrics if metric in df.columns and pd.api.types.is_numeric_dtype(df[metric])]
+        if not valid_metrics:
+            return pd.DataFrame()
+        if not group_col or group_col not in df.columns:
+            return pd.DataFrame([{metric: getattr(df[metric], agg)() if hasattr(df[metric], agg) else df[metric].sum() for metric in valid_metrics}])
+
+        local = df.copy()
+        if group_col:
+            if group_col.lower().endswith("date") or "month" in group_col.lower() or "year" in group_col.lower():
+                converted = pd.to_datetime(local[group_col], errors="coerce")
+                if converted.notna().any():
+                    local[group_col] = converted.dt.strftime("%Y-%m-%d")
+        grouped = local.groupby(group_col, dropna=False)[valid_metrics]
+        if agg == "mean":
+            result = grouped.mean().reset_index()
+        elif agg == "median":
+            result = grouped.median().reset_index()
+        elif agg == "min":
+            result = grouped.min().reset_index()
+        elif agg == "max":
+            result = grouped.max().reset_index()
+        elif agg == "count":
+            result = grouped.count().reset_index()
+        else:
+            result = grouped.sum().reset_index()
+        return result
+
+    def available_chart_types(self, analysis_mode: str) -> List[str]:
+        if analysis_mode == "dashboard":
+            return ["column", "line", "bar", "box", "heatmap", "pie", "donut"]
+        if analysis_mode == "multivariate":
+            return ["column", "bar", "line", "area", "scatter", "box", "heatmap"]
+        return ["column", "bar", "line", "area", "histogram", "box", "pie", "donut"]
+
+    def create_chart(
+        self,
+        df: pd.DataFrame,
+        chart_type: str,
+        metrics: List[str],
+        category_col: Optional[str] = None,
+        date_col: Optional[str] = None,
+        agg: str = "sum",
+    ):
+        if df.empty or not metrics:
+            return None
+        valid_metrics = [metric for metric in metrics if metric in df.columns and pd.api.types.is_numeric_dtype(df[metric])]
+        if not valid_metrics:
+            return None
+
+        group_col = date_col or category_col
+        data = self.aggregate_metrics(df, valid_metrics, group_col=group_col, agg=agg)
+        title_suffix = f" by {group_col}" if group_col else ""
+
+        if chart_type == "heatmap":
+            corr = df[valid_metrics].corr(numeric_only=True)
+            if corr.empty:
+                return None
+            return px.imshow(corr, text_auto=".2f", aspect="auto", title="Metric Correlation Heatmap")
+
+        if chart_type == "histogram":
+            return px.histogram(df, x=valid_metrics[0], title=f"Distribution of {valid_metrics[0]}")
+
+        if chart_type in ["pie", "donut"]:
+            if not group_col:
+                return None
+            pie_metric = valid_metrics[0]
+            fig = px.pie(data, names=group_col, values=pie_metric, title=f"{pie_metric}{title_suffix}")
+            if chart_type == "donut":
+                fig.update_traces(hole=0.45)
+            return fig
+
+        if chart_type == "box":
+            box_x = category_col if category_col in df.columns else None
+            return px.box(df, x=box_x, y=valid_metrics[0], points="outliers", title=f"Box Plot of {valid_metrics[0]}")
+
+        if chart_type == "scatter":
+            if len(valid_metrics) < 2:
+                return None
+            color_col = category_col if category_col in df.columns else None
+            return px.scatter(
+                df,
+                x=valid_metrics[0],
+                y=valid_metrics[1],
+                color=color_col,
+                title=f"{valid_metrics[0]} vs {valid_metrics[1]}",
+            )
+
+        plot_df = data if group_col else data.reset_index(drop=True)
+        if group_col and group_col not in plot_df.columns:
+            return None
+        if len(valid_metrics) > 1 and group_col:
+            melted = plot_df.melt(id_vars=[group_col], value_vars=valid_metrics, var_name="metric", value_name="value")
+            if chart_type == "line":
+                return px.line(melted, x=group_col, y="value", color="metric", markers=True, title=f"Metric Trend{title_suffix}")
+            if chart_type == "area":
+                return px.area(melted, x=group_col, y="value", color="metric", title=f"Metric Area View{title_suffix}")
+            orientation = "h" if chart_type == "bar" else "v"
+            return px.bar(
+                melted,
+                x="value" if orientation == "h" else group_col,
+                y=group_col if orientation == "h" else "value",
+                color="metric",
+                barmode="group",
+                orientation=orientation,
+                title=f"Metric Comparison{title_suffix}",
+            )
+
+        metric = valid_metrics[0]
+        if chart_type == "line":
+            if group_col:
+                return px.line(plot_df, x=group_col, y=metric, markers=True, title=f"{metric}{title_suffix}")
+            return px.line(plot_df, y=metric, title=f"{metric} Trend")
+        if chart_type == "area":
+            if group_col:
+                return px.area(plot_df, x=group_col, y=metric, title=f"{metric}{title_suffix}")
+            return px.area(plot_df, y=metric, title=f"{metric} Area View")
+        if chart_type == "bar":
+            if not group_col:
+                return None
+            return px.bar(plot_df, x=metric, y=group_col, orientation="h", title=f"{metric}{title_suffix}")
+        if chart_type == "column":
+            if not group_col:
+                return None
+            return px.bar(plot_df, x=group_col, y=metric, title=f"{metric}{title_suffix}")
+        return None
+
+    def dashboard_figures(
+        self,
+        df: pd.DataFrame,
+        metrics: List[str],
+        category_col: Optional[str] = None,
+        date_col: Optional[str] = None,
+        chart_types: Optional[List[str]] = None,
+        agg: str = "sum",
+    ) -> List:
+        figures = []
+        for chart_type in chart_types or ["column", "line", "heatmap"]:
+            fig = self.create_chart(
+                df=df,
+                chart_type=chart_type,
+                metrics=metrics,
+                category_col=category_col,
+                date_col=date_col,
+                agg=agg,
+            )
+            if fig is not None:
+                figures.append(fig)
+        return figures
 
     def business_alerts(self, datasets: List[Dict], metric_hints: Optional[List[str]] = None) -> List[Dict]:
         alerts = []

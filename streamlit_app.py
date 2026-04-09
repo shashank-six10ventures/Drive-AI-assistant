@@ -12,7 +12,7 @@ import streamlit as st
 
 from ai_router import AIRouter
 from analytics_engine import AnalyticsEngine
-from config import EXPORT_DIR, settings
+from config import DASHBOARD_PRESETS_PATH, EXPORT_DIR, settings
 from metadata_indexer import MetadataIndexer
 from monitor_drive import DriveMonitor
 from semantic_search import SemanticSearchEngine
@@ -47,6 +47,8 @@ def init_session() -> None:
     st.session_state.setdefault("latest_alerts", [])
     st.session_state.setdefault("business_role", settings.business_role)
     st.session_state.setdefault("llm_enabled", False)
+    st.session_state.setdefault("explorer_folder_id", "")
+    st.session_state.setdefault("selected_preset_name", "")
     default_provider = settings.ai_provider
     if default_provider == "openai" and not settings.openai_api_key and settings.anthropic_api_key:
         default_provider = "anthropic"
@@ -64,6 +66,54 @@ def _ensure_demo_data(indexer: MetadataIndexer) -> int:
             return 3 if result else 0
         return int(result or 0)
     return 0
+
+
+def _reset_chat_and_context() -> None:
+    st.session_state["chat_history"] = []
+    st.session_state["chat_turn_counter"] = 0
+    st.session_state["last_results"] = []
+    st.session_state["last_selected_files"] = []
+    st.session_state["selected_items"] = []
+    st.session_state["latest_results"] = []
+    st.session_state["latest_compare_df"] = None
+    st.session_state["rename_preview"] = []
+    st.session_state["executive_brief"] = None
+    st.session_state["latest_alerts"] = []
+
+
+def _load_dashboard_presets() -> List[Dict]:
+    if not DASHBOARD_PRESETS_PATH.exists():
+        return []
+    try:
+        data = json.loads(DASHBOARD_PRESETS_PATH.read_text(encoding="utf-8"))
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def _save_dashboard_presets(presets: List[Dict]) -> None:
+    DASHBOARD_PRESETS_PATH.write_text(json.dumps(presets, indent=2), encoding="utf-8")
+
+
+def _upsert_dashboard_preset(preset: Dict) -> None:
+    presets = _load_dashboard_presets()
+    presets = [item for item in presets if item.get("name") != preset.get("name")]
+    presets.append(preset)
+    _save_dashboard_presets(sorted(presets, key=lambda item: item.get("name", "").lower()))
+
+
+def _delete_dashboard_preset(name: str) -> None:
+    presets = [item for item in _load_dashboard_presets() if item.get("name") != name]
+    _save_dashboard_presets(presets)
+
+
+def _apply_preset_to_state(preset: Dict) -> None:
+    for key, value in preset.get("state", {}).items():
+        st.session_state[key] = value
+    dataset_ids = preset.get("dataset_ids", [])
+    if dataset_ids:
+        st.session_state["last_selected_files"] = dataset_ids
+        st.session_state["selected_items"] = list(dict.fromkeys(st.session_state["selected_items"] + dataset_ids))
 
 
 def _add_selected_item(file_id: str) -> None:
@@ -308,6 +358,245 @@ def _scroll_chat_to_bottom() -> None:
     )
 
 
+def _render_kpi_cards(kpis: List[Dict], key_prefix: str) -> None:
+    if not kpis:
+        st.caption("No numeric KPI metrics available.")
+        return
+    cols = st.columns(min(4, len(kpis)))
+    for idx, kpi in enumerate(kpis[:4]):
+        with cols[idx]:
+            st.metric(kpi["metric"], f"{kpi['sum']:,.2f}", help=f"Avg: {kpi['average']:,.2f} | Median: {kpi['median']:,.2f}")
+
+
+def _save_builder_preset_ui(
+    preset_scope: str,
+    dataset_ids: List[str],
+    state_keys: List[str],
+    label: str,
+) -> None:
+    preset_name = st.text_input("Preset name", key=f"{preset_scope}_preset_name", placeholder=f"{label} preset")
+    if st.button(f"Save preset for {label}", key=f"{preset_scope}_save_preset"):
+        if not preset_name.strip():
+            st.warning("Enter a preset name before saving.")
+        else:
+            preset = {
+                "name": preset_name.strip(),
+                "scope": preset_scope,
+                "dataset_ids": dataset_ids,
+                "state": {key: st.session_state.get(key) for key in state_keys},
+            }
+            _upsert_dashboard_preset(preset)
+            st.success(f"Saved preset `{preset_name.strip()}`.")
+
+
+def _render_dataset_dashboard(
+    df: pd.DataFrame,
+    analytics: AnalyticsEngine,
+    file_label: str,
+    key_prefix: str,
+    dataset_id: str,
+) -> None:
+    profile = analytics.dataset_profile(df)
+    st.write(
+        {
+            "rows": profile["row_count"],
+            "column_count": profile["column_count"],
+            "numeric_columns": profile["numeric_columns"][:8],
+            "categorical_columns": profile["categorical_columns"][:8],
+            "datetime_columns": profile["datetime_columns"][:8],
+        }
+    )
+
+    with st.expander(f"Dashboard Builder: {file_label}", expanded=True):
+        use_all_metrics = st.checkbox("Use all numeric metrics", key=f"{key_prefix}_all_metrics")
+        default_metrics = profile["metric_suggestions"] if use_all_metrics else profile["metric_suggestions"][: min(2, len(profile["metric_suggestions"]))]
+        selected_metrics = st.multiselect(
+            "Metrics to analyze",
+            options=profile["numeric_columns"],
+            default=[metric for metric in default_metrics if metric in profile["numeric_columns"]],
+            key=f"{key_prefix}_metrics",
+        )
+        analysis_mode = st.radio(
+            "Analysis mode",
+            options=["dashboard", "multivariate", "univariate"],
+            horizontal=True,
+            key=f"{key_prefix}_mode",
+        )
+        agg = st.selectbox(
+            "Aggregation",
+            options=["sum", "mean", "median", "min", "max", "count"],
+            index=0,
+            key=f"{key_prefix}_agg",
+        )
+        category_col = st.selectbox(
+            "Category dimension",
+            options=[""] + profile["categorical_columns"],
+            key=f"{key_prefix}_category",
+        ) or None
+        date_col = st.selectbox(
+            "Time dimension",
+            options=[""] + profile["datetime_columns"],
+            key=f"{key_prefix}_date",
+        ) or None
+        chart_types = st.multiselect(
+            "Chart types",
+            options=analytics.available_chart_types(analysis_mode),
+            default=analytics.available_chart_types(analysis_mode)[:3],
+            key=f"{key_prefix}_charts",
+        )
+        _save_builder_preset_ui(
+            preset_scope=f"dataset::{dataset_id}",
+            dataset_ids=[dataset_id],
+            state_keys=[
+                f"{key_prefix}_all_metrics",
+                f"{key_prefix}_metrics",
+                f"{key_prefix}_mode",
+                f"{key_prefix}_agg",
+                f"{key_prefix}_category",
+                f"{key_prefix}_date",
+                f"{key_prefix}_charts",
+            ],
+            label=file_label,
+        )
+
+        if not selected_metrics:
+            st.warning("Choose at least one numeric metric to build the dashboard.")
+            return
+
+        metric_kpis = analytics.metric_kpis(df, selected_metrics)
+        _render_kpi_cards(metric_kpis, key_prefix=f"{key_prefix}_kpi")
+
+        grouped_preview = analytics.aggregate_metrics(df, selected_metrics, group_col=date_col or category_col, agg=agg)
+        if not grouped_preview.empty:
+            st.caption("Aggregated preview")
+            st.dataframe(grouped_preview.head(20), use_container_width=True)
+
+        figures = analytics.dashboard_figures(
+            df=df,
+            metrics=selected_metrics,
+            category_col=category_col,
+            date_col=date_col,
+            chart_types=chart_types,
+            agg=agg,
+        )
+        if not figures:
+            st.info("No compatible charts could be generated with the current selections. Try a different metric or dimension.")
+        for fig in figures:
+            st.plotly_chart(fig, use_container_width=True)
+
+
+def _render_cross_file_dashboard(datasets: List[Dict], analytics: AnalyticsEngine, key_prefix: str) -> None:
+    if len(datasets) < 2:
+        return
+    common_metrics = analytics.common_numeric_columns(datasets)
+    st.subheader("Cross-file Dashboard")
+    if not common_metrics:
+        st.info("No common numeric metric names were found across the selected datasets, so cross-file comparison is limited.")
+        return
+
+    with st.expander("Compare selected datasets", expanded=True):
+        compare_metrics = st.multiselect(
+            "Metrics to compare across files",
+            options=common_metrics,
+            default=common_metrics[: min(2, len(common_metrics))],
+            key=f"{key_prefix}_cross_metrics",
+        )
+        agg = st.selectbox(
+            "Cross-file aggregation",
+            options=["sum", "mean", "median", "min", "max", "count"],
+            key=f"{key_prefix}_cross_agg",
+        )
+        chart_type = st.selectbox(
+            "Cross-file chart type",
+            options=["column", "bar", "line", "heatmap"],
+            key=f"{key_prefix}_cross_chart",
+        )
+        _save_builder_preset_ui(
+            preset_scope="cross_file",
+            dataset_ids=[item["info"]["file_id"] for item in datasets if item.get("info")],
+            state_keys=[
+                f"{key_prefix}_cross_metrics",
+                f"{key_prefix}_cross_agg",
+                f"{key_prefix}_cross_chart",
+            ],
+            label="cross-file dashboard",
+        )
+        if not compare_metrics:
+            st.warning("Choose at least one common metric.")
+            return
+        compare_df = analytics.compare_metrics_across_files(datasets, compare_metrics, agg=agg)
+        if compare_df.empty:
+            st.info("No comparable values were produced for the selected metrics.")
+            return
+        st.dataframe(compare_df, use_container_width=True)
+        if chart_type == "heatmap":
+            fig = analytics.create_chart(compare_df, "heatmap", metrics=compare_metrics)
+        else:
+            fig = analytics.create_chart(compare_df, chart_type, metrics=compare_metrics, category_col="file_name")
+        if fig:
+            st.plotly_chart(fig, use_container_width=True)
+
+
+def _render_drive_explorer(indexer: MetadataIndexer) -> None:
+    st.subheader("Drive Explorer")
+    folders = indexer.list_items("folder")
+    if not folders:
+        st.caption("No indexed folders available yet. Run Drive sync first.")
+        return
+
+    folder_options = {f"{folder.get('path_text') or folder['file_name']}": folder["file_id"] for folder in folders}
+    labels = [""] + list(folder_options.keys())
+    current_folder_id = st.session_state.get("explorer_folder_id", "")
+    default_label = next((label for label, folder_id in folder_options.items() if folder_id == current_folder_id), "")
+    selected_label = st.selectbox(
+        "Browse folder",
+        options=labels,
+        index=labels.index(default_label) if default_label in labels else 0,
+        key="explorer_folder_label",
+    )
+    selected_folder_id = folder_options.get(selected_label, "")
+    st.session_state["explorer_folder_id"] = selected_folder_id
+
+    if not selected_folder_id:
+        st.caption("Choose a folder to browse indexed files and subfolders.")
+        return
+
+    overview = indexer.folder_overview(selected_folder_id)
+    folder = overview["folder"]
+    st.write(
+        {
+            "folder": folder["file_name"],
+            "path": folder.get("path_text", folder["file_name"]),
+            "child_folders": overview["folder_count"],
+            "child_files": overview["file_count"],
+        }
+    )
+
+    child_items = overview["children"]
+    if child_items:
+        with st.expander("Immediate contents", expanded=True):
+            for item in child_items:
+                _result_card(item, key_prefix=f"explorer_child_{item['file_id']}", interactive=True)
+
+    descendants = indexer.get_descendants(selected_folder_id, include_folders=False)
+    if descendants:
+        with st.expander(f"All files under {folder['file_name']} ({len(descendants)})", expanded=False):
+            st.dataframe(
+                pd.DataFrame(
+                    [
+                        {
+                            "file_name": item["file_name"],
+                            "path": item.get("path_text", ""),
+                            "uploader": item.get("uploader_name", ""),
+                            "type": item.get("file_type", ""),
+                        }
+                        for item in descendants
+                    ]
+                ),
+                use_container_width=True,
+            )
+
+
 def _run_analytics_query(query: str, intent: dict, indexer: MetadataIndexer, analytics: AnalyticsEngine):
     datasets = _load_context_datasets(indexer, analytics, query=query)
 
@@ -326,6 +615,13 @@ def _run_analytics_query(query: str, intent: dict, indexer: MetadataIndexer, ana
         if not trend_fig:
             return {"text": "I couldn't detect a valid date/month column for trend analysis.", "compare_df": None, "trend_fig": None}
         return {"text": f"Monthly trend generated using `{metric_col}` from `{datasets[0]['file_name']}`.", "compare_df": None, "trend_fig": trend_fig}
+    if action == "dashboard":
+        labels = ", ".join([item["file_name"] for item in datasets[:3]])
+        return {
+            "text": f"Interactive dashboard prepared below for: {labels}. Use the metric selectors, aggregation, and chart-type controls to explore KPIs, univariate, multivariate, and cross-file views.",
+            "compare_df": None,
+            "trend_fig": None,
+        }
 
     compare_df = analytics.compare_metric_across_files(datasets, metric_hints=keywords)
     if compare_df.empty:
@@ -527,6 +823,9 @@ with st.sidebar:
             _ensure_demo_data(indexer)
             st.session_state["data_source"] = "demo"
             st.session_state["data_source_detail"] = f"Drive sync failed ({exc}). Using demo data."
+    if st.button("Clear history/context"):
+        _reset_chat_and_context()
+        st.rerun()
 
     st.divider()
     st.subheader("Basket")
@@ -539,6 +838,33 @@ with st.sidebar:
             st.session_state["selected_items"] = []
     else:
         st.caption("Add files or folders from chat results to build combined views, dashboards, and rename batches.")
+
+    st.divider()
+    st.subheader("Dashboard Presets")
+    presets = _load_dashboard_presets()
+    preset_names = [preset["name"] for preset in presets]
+    selected_preset = st.selectbox(
+        "Saved presets",
+        options=[""] + preset_names,
+        index=([""] + preset_names).index(st.session_state["selected_preset_name"])
+        if st.session_state["selected_preset_name"] in preset_names
+        else 0,
+    )
+    st.session_state["selected_preset_name"] = selected_preset
+    load_col, delete_col = st.columns(2)
+    with load_col:
+        if st.button("Load preset", disabled=not selected_preset):
+            preset = next((item for item in presets if item["name"] == selected_preset), None)
+            if preset:
+                _apply_preset_to_state(preset)
+                st.success(f"Loaded preset `{selected_preset}`.")
+                st.rerun()
+    with delete_col:
+        if st.button("Delete preset", disabled=not selected_preset):
+            _delete_dashboard_preset(selected_preset)
+            st.session_state["selected_preset_name"] = ""
+            st.success("Preset deleted.")
+            st.rerun()
 
 ai_router = AIRouter(st.session_state["llm_provider"], enabled=st.session_state["llm_enabled"])
 
@@ -602,6 +928,9 @@ with st.expander("Current context", expanded=False):
             st.write(f"- {item['file_name']} ({item.get('item_kind', 'file')})")
     else:
         st.caption("No active context yet. Search, select, or add items to the basket.")
+
+st.divider()
+_render_drive_explorer(indexer)
 
 st.subheader("Chat")
 _show_chat_history()
@@ -841,6 +1170,23 @@ else:
     st.caption("Add files to the basket or select datasets below to generate executive KPIs and alerts.")
 
 st.divider()
+st.subheader("Interactive Dashboard")
+dashboard_context = _load_context_datasets(indexer, analytics, query="selected dashboard", prefer_selected=True)
+if dashboard_context:
+    _render_cross_file_dashboard(dashboard_context, analytics, key_prefix="global_dashboard")
+    for dashboard_item in dashboard_context[:3]:
+        st.markdown(f"### Dashboard: {dashboard_item['file_name']}")
+        _render_dataset_dashboard(
+            dashboard_item["df"],
+            analytics,
+            file_label=dashboard_item["file_name"],
+            key_prefix=f"dashboard_{dashboard_item['info']['file_id']}",
+            dataset_id=dashboard_item["info"]["file_id"],
+        )
+else:
+    st.caption("Select one or more datasets below, or add files to the basket, to open the interactive dashboard builder.")
+
+st.divider()
 st.subheader("Dataset Details")
 _ensure_demo_data(indexer)
 all_files = indexer.list_files()
@@ -866,15 +1212,24 @@ if selected:
             continue
 
         summary = analytics.dataset_summary(df)
+        profile = analytics.dataset_profile(df)
         st.write(
             {
                 "rows": summary["rows"],
                 "column_count": len(summary["columns"]),
-                "columns": summary["columns"][:12],
+                "numeric_columns": profile["numeric_columns"][:8],
+                "categorical_columns": profile["categorical_columns"][:8],
+                "suggested_metrics": profile["metric_suggestions"][:6],
             }
         )
         st.dataframe(df.head(50), use_container_width=True)
-
+        _render_dataset_dashboard(
+            df,
+            analytics,
+            file_label=info["file_name"],
+            key_prefix=f"details_{file_id}",
+            dataset_id=file_id,
+        )
         metric_col = analytics.find_best_column(df, ["revenue", "sales", "profit"])
         if not metric_col:
             st.warning("No numeric metric column found for this dataset.")
