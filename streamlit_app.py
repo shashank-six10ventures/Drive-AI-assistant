@@ -9,6 +9,15 @@ from typing import Dict, List
 
 import pandas as pd
 import streamlit as st
+from PIL import Image
+
+try:
+    from reportlab.lib.pagesizes import letter
+    from reportlab.lib.utils import ImageReader
+    from reportlab.pdfgen import canvas
+    REPORTLAB_AVAILABLE = True
+except Exception:
+    REPORTLAB_AVAILABLE = False
 
 from ai_router import AIRouter
 from analytics_engine import AnalyticsEngine
@@ -21,6 +30,112 @@ from semantic_search import SemanticSearchEngine
 st.set_page_config(page_title="Drive AI Assistant", layout="wide")
 st.title("Drive AI Assistant")
 st.caption("Conversational Drive intelligence with memory, analytics, and exports")
+st.markdown(
+    """
+    <style>
+    .dataset-toolbar {
+        position: sticky;
+        top: 0.5rem;
+        z-index: 20;
+        background: linear-gradient(135deg, #f7fbff 0%, #eef7f2 100%);
+        border: 1px solid #d9e8dd;
+        border-radius: 14px;
+        padding: 0.85rem 1rem;
+        margin: 0.25rem 0 1rem 0;
+        box-shadow: 0 8px 20px rgba(30, 60, 90, 0.08);
+    }
+    .dataset-toolbar-title {
+        font-weight: 700;
+        font-size: 1rem;
+        color: #16324f;
+        margin-bottom: 0.2rem;
+    }
+    .dataset-toolbar-meta {
+        color: #486581;
+        font-size: 0.92rem;
+        line-height: 1.35;
+    }
+    .dataset-mini-nav {
+        position: sticky;
+        top: 5.4rem;
+        z-index: 19;
+        background: rgba(255,255,255,0.92);
+        border: 1px solid #d8e4ef;
+        border-radius: 12px;
+        padding: 0.5rem 0.8rem;
+        margin: 0 0 1rem 0;
+        backdrop-filter: blur(6px);
+    }
+    .dataset-mini-nav summary {
+        cursor: pointer;
+        font-weight: 700;
+        color: #17324d;
+        margin-bottom: 0.25rem;
+    }
+    .dataset-mini-nav a {
+        display: inline-block;
+        margin: 0.2rem 0.6rem 0.2rem 0;
+        color: #245c8a;
+        text-decoration: none;
+        font-size: 0.9rem;
+        font-weight: 600;
+    }
+    .dataset-mini-nav a:hover {
+        text-decoration: underline;
+    }
+    .benchmark-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+        gap: 0.75rem;
+        margin: 0.35rem 0 1rem 0;
+    }
+    .benchmark-card {
+        border-radius: 14px;
+        padding: 0.9rem 1rem;
+        border: 1px solid rgba(0,0,0,0.06);
+        box-shadow: 0 8px 18px rgba(20, 34, 51, 0.06);
+    }
+    .benchmark-card.good {
+        background: linear-gradient(135deg, #f2fff7 0%, #e4f9ea 100%);
+        border-color: #b8e3c4;
+    }
+    .benchmark-card.warn {
+        background: linear-gradient(135deg, #fff6f2 0%, #fde7df 100%);
+        border-color: #f0c4b4;
+    }
+    .benchmark-card.neutral {
+        background: linear-gradient(135deg, #f8fbff 0%, #eef3fb 100%);
+        border-color: #d8e2f1;
+    }
+    .benchmark-label {
+        font-size: 0.8rem;
+        font-weight: 700;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+        color: #5a6c7d;
+        margin-bottom: 0.25rem;
+    }
+    .benchmark-value {
+        font-size: 1.05rem;
+        font-weight: 700;
+        color: #16212f;
+        margin-bottom: 0.15rem;
+    }
+    .benchmark-delta {
+        font-size: 0.95rem;
+        font-weight: 700;
+        color: #1f3c56;
+        margin-bottom: 0.25rem;
+    }
+    .benchmark-detail {
+        font-size: 0.85rem;
+        color: #52606d;
+        line-height: 1.3;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 
 @st.cache_resource
@@ -49,6 +164,7 @@ def init_session() -> None:
     st.session_state.setdefault("llm_enabled", False)
     st.session_state.setdefault("explorer_folder_id", "")
     st.session_state.setdefault("selected_preset_name", "")
+    st.session_state.setdefault("dataset_selection", [])
     default_provider = settings.ai_provider
     if default_provider == "openai" and not settings.openai_api_key and settings.anthropic_api_key:
         default_provider = "anthropic"
@@ -79,6 +195,7 @@ def _reset_chat_and_context() -> None:
     st.session_state["rename_preview"] = []
     st.session_state["executive_brief"] = None
     st.session_state["latest_alerts"] = []
+    st.session_state["dataset_selection"] = []
 
 
 def _load_dashboard_presets() -> List[Dict]:
@@ -89,6 +206,17 @@ def _load_dashboard_presets() -> List[Dict]:
         return data if isinstance(data, list) else []
     except Exception:
         return []
+
+
+def _sync_dataset_selection_from_widget() -> None:
+    selected = st.session_state.get("dataset_selection", [])
+    if not selected:
+        return
+    file_ids = [item.split("|")[0].strip() for item in selected if "|" in item]
+    if not file_ids:
+        return
+    st.session_state["last_selected_files"] = file_ids
+    st.session_state["selected_items"] = list(dict.fromkeys(st.session_state["selected_items"] + file_ids))
 
 
 def _save_dashboard_presets(presets: List[Dict]) -> None:
@@ -242,6 +370,7 @@ def _load_context_datasets(
     query: str = "",
     prefer_selected: bool = False,
 ) -> List[Dict]:
+    _sync_dataset_selection_from_widget()
     query_lower = query.lower()
     use_basket = prefer_selected or any(token in query_lower for token in ["selected", "basket", "picked"])
     if st.session_state["last_selected_files"]:
@@ -280,6 +409,9 @@ def _show_chat_history() -> None:
             if msg["role"] == "assistant" and msg.get("compare_rows"):
                 with st.expander("Comparison output", expanded=False):
                     st.dataframe(pd.DataFrame(msg["compare_rows"]), use_container_width=True)
+            if msg["role"] == "assistant" and msg.get("analysis_rows"):
+                with st.expander("Current dataset analysis", expanded=False):
+                    st.dataframe(pd.DataFrame(msg["analysis_rows"]), use_container_width=True)
             if msg["role"] == "assistant" and msg.get("rename_preview"):
                 with st.expander("Rename preview", expanded=False):
                     st.dataframe(pd.DataFrame(msg["rename_preview"]), use_container_width=True)
@@ -327,7 +459,7 @@ def _summarize_dataset_rule_based(file_name: str, metrics: Dict, anomalies: Dict
         lines.append(f"Total is {metrics['sum']:,.2f} and average is {metrics['average']:,.2f}.")
     lines.extend(extra_insights[:2])
     if anomalies.get("count", 0):
-        lines.append(f"{anomalies['count']} anomaly rows need review.")
+        lines.append(f"{anomalies['count']} unusual observations need review.")
     return " ".join(lines)
 
 
@@ -340,6 +472,88 @@ def _summarize_market_compare_rule_based(compare_df: pd.DataFrame) -> str:
         f"Cheapest matching Amazon listing is `{cheapest['market_item']}` at {cheapest['market_price']:,.2f}. "
         f"The largest gap versus your internal average is `{highest_gap['market_item']}` with a gap of {highest_gap['price_gap']:,.2f}."
     )
+
+
+def _looks_like_current_dataset_question(query: str) -> bool:
+    query_lower = query.lower()
+    negative_triggers = [
+        "show files",
+        "show folders",
+        "list files",
+        "list folders",
+        "uploaded by",
+        "find file",
+        "find folder",
+    ]
+    if any(token in query_lower for token in negative_triggers):
+        return False
+    triggers = [
+        "current file",
+        "this file",
+        "current dataset",
+        "selected file",
+        "selected dataset",
+        "in this",
+        "in current",
+        "asin wise",
+        "group by",
+        "top ",
+        "highest ",
+        "lowest ",
+        "trend",
+        "average",
+        "total",
+        "sum",
+        "sorted by",
+        "wise",
+        "group by",
+    ]
+    return any(token in query_lower for token in triggers)
+
+
+def _should_answer_from_current_dataset(query: str) -> bool:
+    _sync_dataset_selection_from_widget()
+    if not st.session_state["last_selected_files"]:
+        return False
+    if _looks_like_current_dataset_question(query):
+        return True
+    query_lower = query.lower()
+    analytic_terms = [
+        "analyze",
+        "analyse",
+        "trend",
+        "top",
+        "highest",
+        "lowest",
+        "average",
+        "sum",
+        "total",
+        "group by",
+        "wise",
+        "sorted by",
+    ]
+    retrieval_terms = ["show files", "show folders", "list files", "list folders", "uploaded by"]
+    return any(term in query_lower for term in analytic_terms) and not any(term in query_lower for term in retrieval_terms)
+
+
+def _render_column_guide(profile: Dict) -> None:
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.caption("Numeric")
+        for item in profile["numeric_columns"][:12]:
+            st.write(f"- {item}")
+    with col2:
+        st.caption("Categorical")
+        for item in profile["categorical_columns"][:12]:
+            st.write(f"- {item}")
+    with col3:
+        st.caption("Time / Suggested")
+        for item in profile["datetime_columns"][:8]:
+            st.write(f"- {item}")
+        if profile["metric_suggestions"]:
+            st.caption("Suggested metrics")
+            for item in profile["metric_suggestions"][:8]:
+                st.write(f"- {item}")
 
 
 def _scroll_chat_to_bottom() -> None:
@@ -358,14 +572,203 @@ def _scroll_chat_to_bottom() -> None:
     )
 
 
-def _render_kpi_cards(kpis: List[Dict], key_prefix: str) -> None:
+def _render_kpi_cards(
+    kpis: List[Dict],
+    key_prefix: str,
+    definitions: Dict[str, str] | None = None,
+    analytics: AnalyticsEngine | None = None,
+) -> None:
     if not kpis:
         st.caption("No numeric KPI metrics available.")
         return
+    definitions = definitions or {}
     cols = st.columns(min(4, len(kpis)))
     for idx, kpi in enumerate(kpis[:4]):
         with cols[idx]:
-            st.metric(kpi["metric"], f"{kpi['sum']:,.2f}", help=f"Avg: {kpi['average']:,.2f} | Median: {kpi['median']:,.2f}")
+            formatted_sum = analytics.format_metric_value(kpi["metric"], kpi["sum"]) if analytics else f"{kpi['sum']:,.2f}"
+            formatted_avg = analytics.format_metric_value(kpi["metric"], kpi["average"]) if analytics else f"{kpi['average']:,.2f}"
+            formatted_median = analytics.format_metric_value(kpi["metric"], kpi["median"]) if analytics else f"{kpi['median']:,.2f}"
+            help_text = f"Avg: {formatted_avg} | Median: {formatted_median}"
+            if kpi["metric"] in definitions:
+                help_text = f"{definitions[kpi['metric']]}\n\n{help_text}"
+            st.metric(analytics.humanize_label(kpi["metric"]) if analytics else kpi["metric"], formatted_sum, help=help_text)
+
+
+def _render_benchmark_cards(cards: List[Dict]) -> None:
+    if not cards:
+        st.caption("No benchmark cards available for the current dataset.")
+        return
+    chunks = []
+    for card in cards[:4]:
+        label_lower = card["label"].lower()
+        card_class = "neutral"
+        if any(token in label_lower for token in ["best", "fastest", "highest"]):
+            card_class = "good"
+        elif any(token in label_lower for token in ["weakest", "lowest"]):
+            card_class = "warn"
+        chunks.append(
+            f"""
+            <div class="benchmark-card {card_class}">
+                <div class="benchmark-label">{card['label']}</div>
+                <div class="benchmark-value">{card['value']}</div>
+                <div class="benchmark-delta">{card['formatted']}</div>
+                <div class="benchmark-detail">{card['detail']}</div>
+            </div>
+            """
+        )
+    st.markdown(f"<div class='benchmark-grid'>{''.join(chunks)}</div>", unsafe_allow_html=True)
+
+
+def _render_chart_reasons(chart_reasons: List[Dict]) -> None:
+    if not chart_reasons:
+        st.caption("No chart-selection notes available.")
+        return
+    for item in chart_reasons:
+        st.markdown(f"- **{item['chart_type'].title()}**: {item['reason']}")
+
+
+def _slugify(text: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9]+", "-", text.strip().lower()).strip("-")
+
+
+def _render_anchor(anchor_id: str) -> None:
+    st.markdown(f"<div id='{anchor_id}'></div>", unsafe_allow_html=True)
+
+
+def _render_dataset_mini_nav(dataset_id: str) -> None:
+    sections = [
+        ("Summary", f"{dataset_id}-summary"),
+        ("Metric guide", f"{dataset_id}-metric-guide"),
+        ("Benchmarks", f"{dataset_id}-benchmarks"),
+        ("Full table", f"{dataset_id}-full-table"),
+        ("KPIs", f"{dataset_id}-kpis"),
+        ("Best dashboard", f"{dataset_id}-best-dashboard"),
+        ("Builder", f"{dataset_id}-builder"),
+        ("Anomalies", f"{dataset_id}-anomalies"),
+        ("Exports", f"{dataset_id}-exports"),
+    ]
+    links = "".join([f"<a href='#{anchor}'>{label}</a>" for label, anchor in sections])
+    st.markdown(
+        f"""
+        <details class="dataset-mini-nav" open>
+            <summary>Jump within this dataset</summary>
+            <div>{links}</div>
+        </details>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _render_dataset_toolbar(
+    file_name: str,
+    dataset_type: str,
+    row_count: int,
+    column_count: int,
+    primary_metric: str | None,
+    time_dim: str | None,
+    category_dim: str | None,
+) -> None:
+    metric_text = primary_metric or "No primary metric detected"
+    time_text = time_dim or "No time grain detected"
+    category_text = category_dim or "No category grain detected"
+    st.markdown(
+        f"""
+        <div class="dataset-toolbar">
+            <div class="dataset-toolbar-title">{file_name}</div>
+            <div class="dataset-toolbar-meta">
+                <strong>Type:</strong> {dataset_type.title()} |
+                <strong>Rows:</strong> {row_count:,} |
+                <strong>Columns:</strong> {column_count} |
+                <strong>Primary metric:</strong> {metric_text} |
+                <strong>Time grain:</strong> {time_text} |
+                <strong>Category grain:</strong> {category_text}
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _render_chart_grid(figures: List) -> None:
+    if not figures:
+        return
+    cols = st.columns(2)
+    for idx, fig in enumerate(figures):
+        with cols[idx % 2]:
+            st.plotly_chart(fig, use_container_width=True)
+
+
+def _figure_png_bytes(fig):
+    try:
+        return fig.to_image(format="png", scale=2)
+    except Exception:
+        return None
+
+
+def _dashboard_pdf_bytes(title: str, panels: List[Dict]) -> bytes | None:
+    if not REPORTLAB_AVAILABLE:
+        return None
+    png_images = []
+    for panel in panels:
+        png_bytes = _figure_png_bytes(panel["figure"])
+        if png_bytes:
+            png_images.append((panel["chart_type"], png_bytes))
+    if not png_images:
+        return None
+
+    buffer = io.BytesIO()
+    pdf = canvas.Canvas(buffer, pagesize=letter)
+    width, height = letter
+    for idx, (chart_type, png_bytes) in enumerate(png_images):
+        image = Image.open(io.BytesIO(png_bytes))
+        image_width, image_height = image.size
+        max_width = width - 72
+        max_height = height - 140
+        scale = min(max_width / image_width, max_height / image_height)
+        draw_width = image_width * scale
+        draw_height = image_height * scale
+        x = (width - draw_width) / 2
+        y = height - draw_height - 80
+        pdf.setFont("Helvetica-Bold", 14)
+        pdf.drawString(36, height - 40, title)
+        pdf.setFont("Helvetica", 11)
+        pdf.drawString(36, height - 58, f"Chart {idx + 1}: {chart_type.title()}")
+        pdf.drawImage(ImageReader(io.BytesIO(png_bytes)), x, y, width=draw_width, height=draw_height)
+        pdf.showPage()
+    pdf.save()
+    return buffer.getvalue()
+
+
+def _render_chart_panels(panels: List[Dict], dataset_id: str, section_key: str) -> None:
+    if not panels:
+        return
+    cols = st.columns(2)
+    for idx, panel in enumerate(panels):
+        with cols[idx % 2]:
+            st.plotly_chart(panel["figure"], use_container_width=True)
+            btn_cols = st.columns(2)
+            png_bytes = _figure_png_bytes(panel["figure"])
+            with btn_cols[0]:
+                if png_bytes:
+                    st.download_button(
+                        f"PNG: {panel['chart_type'].title()}",
+                        data=png_bytes,
+                        file_name=f"{dataset_id}_{section_key}_{idx + 1}_{panel['chart_type']}.png",
+                        mime="image/png",
+                        key=f"{section_key}_png_{dataset_id}_{idx}",
+                    )
+                else:
+                    st.caption("PNG export unavailable")
+            with btn_cols[1]:
+                source_df = panel.get("data", pd.DataFrame())
+                if isinstance(source_df, pd.DataFrame) and not source_df.empty:
+                    st.download_button(
+                        f"CSV: {panel['chart_type'].title()}",
+                        data=source_df.to_csv(index=False).encode("utf-8"),
+                        file_name=f"{dataset_id}_{section_key}_{idx + 1}_{panel['chart_type']}.csv",
+                        mime="text/csv",
+                        key=f"{section_key}_csv_{dataset_id}_{idx}",
+                    )
 
 
 def _save_builder_preset_ui(
@@ -397,15 +800,15 @@ def _render_dataset_dashboard(
     dataset_id: str,
 ) -> None:
     profile = analytics.dataset_profile(df)
-    st.write(
-        {
-            "rows": profile["row_count"],
-            "column_count": profile["column_count"],
-            "numeric_columns": profile["numeric_columns"][:8],
-            "categorical_columns": profile["categorical_columns"][:8],
-            "datetime_columns": profile["datetime_columns"][:8],
-        }
+    dataset_type = analytics.infer_dataset_type(df)
+    metric_definition_map = {item["metric"]: item["definition"] for item in analytics.metric_definitions(df)}
+    st.caption(
+        f"{file_label}: {profile['row_count']} rows, {profile['column_count']} columns, "
+        f"{len(profile['numeric_columns'])} numeric fields, {len(profile['categorical_columns'])} grouping fields."
     )
+    st.caption(f"Detected dataset type: `{dataset_type}`")
+    if profile["metric_suggestions"]:
+        st.caption(f"Suggested comparison metrics: {', '.join(profile['metric_suggestions'][:5])}")
 
     with st.expander(f"Dashboard Builder: {file_label}", expanded=True):
         use_all_metrics = st.checkbox("Use all numeric metrics", key=f"{key_prefix}_all_metrics")
@@ -464,14 +867,16 @@ def _render_dataset_dashboard(
             return
 
         metric_kpis = analytics.metric_kpis(df, selected_metrics)
-        _render_kpi_cards(metric_kpis, key_prefix=f"{key_prefix}_kpi")
+        _render_kpi_cards(metric_kpis, key_prefix=f"{key_prefix}_kpi", definitions=metric_definition_map, analytics=analytics)
 
         grouped_preview = analytics.aggregate_metrics(df, selected_metrics, group_col=date_col or category_col, agg=agg)
         if not grouped_preview.empty:
-            st.caption("Aggregated preview")
+            preview_label = date_col or category_col or "overall dataset"
+            st.caption(f"Preview table aggregated by `{preview_label}` using `{agg}`.")
             st.dataframe(grouped_preview.head(20), use_container_width=True)
 
         figures = analytics.dashboard_figures(
+        panels = analytics.dashboard_panels(
             df=df,
             metrics=selected_metrics,
             category_col=category_col,
@@ -479,10 +884,82 @@ def _render_dataset_dashboard(
             chart_types=chart_types,
             agg=agg,
         )
-        if not figures:
+        with st.expander("Why these chart types work", expanded=False):
+            _render_chart_reasons(
+                [
+                    {
+                        "chart_type": chart_type,
+                        "reason": analytics.explain_chart_choice(chart_type, selected_metrics, category_col, date_col, agg),
+                    }
+                    for chart_type in chart_types
+                ]
+            )
+        if not panels:
             st.info("No compatible charts could be generated with the current selections. Try a different metric or dimension.")
-        for fig in figures:
-            st.plotly_chart(fig, use_container_width=True)
+        _render_chart_panels(panels, dataset_id=dataset_id, section_key=key_prefix)
+
+
+def _render_metric_definitions(definitions: List[Dict]) -> None:
+    if not definitions:
+        st.caption("No suggested metric definitions available.")
+        return
+    for item in definitions:
+        st.markdown(f"**{item['label']}**")
+        st.caption(item["definition"])
+
+
+def _render_grouped_anomaly_review(
+    df: pd.DataFrame,
+    analytics: AnalyticsEngine,
+    default_bundle: Dict,
+    file_id: str,
+    primary_metric: str | None,
+) -> None:
+    if not primary_metric:
+        st.caption("No primary numeric metric was detected, so anomaly review is unavailable.")
+        return
+    grain_options = ["Raw rows"] + default_bundle.get("grain_options", [])
+    selected_grain = st.selectbox(
+        "Anomaly grain",
+        options=grain_options,
+        key=f"anomaly_grain_{file_id}",
+        help="Choose the business grain used to detect unusual values. Grouped anomalies are usually easier to trust than raw row outliers.",
+    )
+    if selected_grain == "Raw rows":
+        anomalies = analytics.detect_anomalies(df, primary_metric)
+        st.write(anomalies["method"] or "No anomaly method was applied.")
+        if anomalies.get("bounds"):
+            bounds = anomalies["bounds"]
+            st.caption(
+                f"Thresholds for `{primary_metric}`: lower {bounds['lower']:,.2f}, upper {bounds['upper']:,.2f}. "
+                "Values outside this IQR range are flagged for review."
+            )
+        if anomalies["rows"]:
+            st.dataframe(pd.DataFrame(anomalies["rows"]).head(20), use_container_width=True)
+        else:
+            st.caption("No raw-row anomalies were detected for the selected metric.")
+        return
+
+    grouped = analytics.detect_grouped_anomalies(df, primary_metric, selected_grain, agg="sum")
+    st.write(grouped["method"] or "No grouped anomaly method was applied.")
+    if grouped.get("bounds"):
+        bounds = grouped["bounds"]
+        st.caption(
+            f"Grouped thresholds for `{primary_metric}` by `{selected_grain}`: lower {bounds['lower']:,.2f}, upper {bounds['upper']:,.2f}."
+        )
+    grouped_table = pd.DataFrame(grouped.get("grouped_table", []))
+    if not grouped_table.empty:
+        st.caption(f"Grouped view for anomaly detection by `{selected_grain}`")
+        st.dataframe(grouped_table.head(30), use_container_width=True)
+        grouped_chart = analytics.create_chart(grouped_table, "bar", [primary_metric], category_col=selected_grain, agg="sum")
+        if grouped_chart:
+            st.plotly_chart(grouped_chart, use_container_width=True)
+    flagged_rows = pd.DataFrame(grouped["rows"])
+    if not flagged_rows.empty:
+        st.caption("Flagged grouped anomalies")
+        st.dataframe(flagged_rows, use_container_width=True)
+    else:
+        st.caption(f"No grouped anomalies were detected by `{selected_grain}`.")
 
 
 def _render_cross_file_dashboard(datasets: List[Dict], analytics: AnalyticsEngine, key_prefix: str) -> None:
@@ -563,14 +1040,11 @@ def _render_drive_explorer(indexer: MetadataIndexer) -> None:
 
     overview = indexer.folder_overview(selected_folder_id)
     folder = overview["folder"]
-    st.write(
-        {
-            "folder": folder["file_name"],
-            "path": folder.get("path_text", folder["file_name"]),
-            "child_folders": overview["folder_count"],
-            "child_files": overview["file_count"],
-        }
-    )
+    st.caption(f"Browsing `{folder.get('path_text', folder['file_name'])}`")
+    exp_a, exp_b, exp_c = st.columns(3)
+    exp_a.metric("Child folders", overview["folder_count"])
+    exp_b.metric("Child files", overview["file_count"])
+    exp_c.metric("Indexed descendants", len(indexer.get_descendants(selected_folder_id, include_folders=False)))
 
     child_items = overview["children"]
     if child_items:
@@ -663,6 +1137,21 @@ def _run_alerts_query(indexer: MetadataIndexer, analytics: AnalyticsEngine):
         return {"text": "I didn't detect any major numeric anomalies in the current dataset context."}
     messages = [f"{item['file_name']}: {item['message']}" for item in alerts[:5]]
     return {"text": "Business alerts:\n- " + "\n- ".join(messages)}
+
+
+def _run_current_dataset_query(query: str, indexer: MetadataIndexer, analytics: AnalyticsEngine):
+    datasets = _load_context_datasets(indexer, analytics, query=query)
+    if not datasets:
+        return {
+            "text": "Select a dataset first, then ask a question about the current file.",
+            "table": pd.DataFrame(),
+            "chart": None,
+            "dataset_name": "",
+        }
+    target = datasets[0]
+    answer = analytics.answer_dataset_question(target["df"], query)
+    answer["dataset_name"] = target["file_name"]
+    return answer
 
 
 def _run_executive_brief(indexer: MetadataIndexer, analytics: AnalyticsEngine, ai_router: AIRouter):
@@ -771,6 +1260,7 @@ def _run_amazon_compare_query(query: str, indexer: MetadataIndexer, analytics: A
 indexer, search_engine, analytics = get_services()
 init_session()
 bootstrap_data_source(indexer)
+_sync_dataset_selection_from_widget()
 
 with st.sidebar:
     st.subheader("Drive Sync")
@@ -937,6 +1427,7 @@ _show_chat_history()
 user_query = st.chat_input("Ask: Show files uploaded by Amber / From these, which contain revenue data?")
 
 if user_query:
+    _sync_dataset_selection_from_widget()
     st.session_state["chat_history"].append({"role": "user", "content": user_query})
     with st.chat_message("user"):
         st.write(user_query)
@@ -966,8 +1457,16 @@ if user_query:
     market_compare_df = None
     market_raw_results = None
     rename_preview = []
+    dataset_query_table = None
+    dataset_query_chart = None
 
-    if intent.get("action") in ["compare", "trend", "dashboard"]:
+    if _should_answer_from_current_dataset(user_query):
+        payload = _run_current_dataset_query(user_query, indexer, analytics)
+        dataset_name = payload.get("dataset_name", "")
+        assistant_text = f"Current dataset: `{dataset_name}`. {payload['text']}" if dataset_name else payload["text"]
+        dataset_query_table = payload["table"]
+        dataset_query_chart = payload["chart"]
+    elif intent.get("action") in ["compare", "trend", "dashboard"]:
         payload = _run_analytics_query(user_query, intent, indexer, analytics)
         assistant_text = payload["text"]
         st.session_state["latest_compare_df"] = payload["compare_df"]
@@ -1053,6 +1552,7 @@ if user_query:
         "compare_rows": st.session_state["latest_compare_df"].to_dict(orient="records")
         if st.session_state["latest_compare_df"] is not None
         else None,
+        "analysis_rows": dataset_query_table.to_dict(orient="records") if isinstance(dataset_query_table, pd.DataFrame) and not dataset_query_table.empty else None,
         "rename_preview": rename_preview,
         "alerts_rows": st.session_state.get("latest_alerts"),
         "market_rows": market_compare_df.to_dict(orient="records") if market_compare_df is not None else None,
@@ -1092,6 +1592,11 @@ if user_query:
             fig = analytics.compare_chart(compare_df)
             if fig:
                 st.plotly_chart(fig, use_container_width=True)
+
+        if dataset_query_table is not None and not dataset_query_table.empty:
+            st.dataframe(dataset_query_table, use_container_width=True)
+        if dataset_query_chart is not None:
+            st.plotly_chart(dataset_query_chart, use_container_width=True)
 
         if trend_fig is not None:
             st.plotly_chart(trend_fig, use_container_width=True)
@@ -1159,12 +1664,19 @@ if current_context_datasets:
     col1.metric("Datasets in context", context_files)
     col2.metric("Total rows", f"{total_rows:,}")
     col3.metric("Active alerts", total_alerts)
-    kpi_df = pd.DataFrame(brief["kpis"])
-    if not kpi_df.empty:
-        st.dataframe(kpi_df, use_container_width=True)
-    alerts_df = pd.DataFrame(brief["alerts"])
-    if not alerts_df.empty:
-        st.dataframe(alerts_df, use_container_width=True)
+    st.markdown("#### What This Context Contains")
+    for headline in brief["headlines"][:5]:
+        st.write(f"- {headline}")
+    if brief["alerts"]:
+        st.markdown("#### Priority Alerts")
+        for alert in brief["alerts"][:5]:
+            st.warning(f"{alert['file_name']}: {alert['message']}")
+    else:
+        st.caption("No high-priority alert signals were detected in the current context.")
+    with st.expander("KPI table", expanded=False):
+        kpi_df = pd.DataFrame(brief["kpis"])
+        if not kpi_df.empty:
+            st.dataframe(kpi_df, use_container_width=True)
     st.write(_summarize_brief_rule_based(brief))
 else:
     st.caption("Add files to the basket or select datasets below to generate executive KPIs and alerts.")
@@ -1194,11 +1706,11 @@ tabular_files = [f for f in all_files if Path(f.get("local_path", "")).suffix.lo
 selected = st.multiselect(
     "Select one or more datasets",
     options=[f"{f['file_id']} | {f['file_name']}" for f in tabular_files],
+    key="dataset_selection",
 )
 
 if selected:
-    st.session_state["last_selected_files"] = [item.split("|")[0].strip() for item in selected]
-    st.session_state["selected_items"] = list(dict.fromkeys(st.session_state["selected_items"] + st.session_state["last_selected_files"]))
+    _sync_dataset_selection_from_widget()
     for item in selected:
         file_id = item.split("|")[0].strip()
         info = indexer.get_file(file_id)
@@ -1211,18 +1723,89 @@ if selected:
             st.error(f"Failed to load `{info['file_name']}`: {exc}")
             continue
 
-        summary = analytics.dataset_summary(df)
         profile = analytics.dataset_profile(df)
-        st.write(
-            {
-                "rows": summary["rows"],
-                "column_count": len(summary["columns"]),
-                "numeric_columns": profile["numeric_columns"][:8],
-                "categorical_columns": profile["categorical_columns"][:8],
-                "suggested_metrics": profile["metric_suggestions"][:6],
-            }
+        default_bundle = analytics.default_dashboard_bundle(df)
+        default_panels = default_bundle.get("panels", [])
+        dataset_type = default_bundle.get("dataset_type", analytics.infer_dataset_type(df))
+        metric_definition_map = {
+            item["metric"]: item["definition"] for item in default_bundle.get("metric_definitions", [])
+        }
+        dimensions = default_bundle["dimensions"]
+        primary_metric = default_bundle["metrics"][0] if default_bundle["metrics"] else analytics.find_best_column(df, ["revenue", "sales", "profit"])
+        grouped_anomalies = default_bundle.get("grouped_anomalies", {"count": 0, "rows": [], "method": "", "bounds": {}})
+        anomaly_count = grouped_anomalies["count"] if grouped_anomalies.get("count") else 0
+        dataset_anchor_base = _slugify(file_id)
+        _render_dataset_toolbar(
+            file_name=info["file_name"],
+            dataset_type=dataset_type,
+            row_count=profile["row_count"],
+            column_count=profile["column_count"],
+            primary_metric=analytics.humanize_label(primary_metric) if primary_metric else None,
+            time_dim=analytics.humanize_label(dimensions["time"]) if dimensions.get("time") else None,
+            category_dim=analytics.humanize_label(dimensions["category"]) if dimensions.get("category") else None,
         )
-        st.dataframe(df.head(50), use_container_width=True)
+        _render_dataset_mini_nav(dataset_anchor_base)
+        _render_anchor(f"{dataset_anchor_base}-summary")
+        st.markdown(analytics.explain_table(df))
+        st.caption(default_bundle.get("narrative", ""))
+
+        overview_col1, overview_col2, overview_col3, overview_col4 = st.columns(4)
+        overview_col1.metric("Rows", f"{profile['row_count']:,}")
+        overview_col2.metric("Columns", profile["column_count"])
+        overview_col3.metric("Dataset type", dataset_type.title())
+        overview_col4.metric("Grouped anomalies", anomaly_count)
+
+        with st.expander("Column guide", expanded=False):
+            st.caption(f"Best time dimension: {dimensions['time'] or 'Not detected'}")
+            st.caption(f"Best category dimension: {dimensions['category'] or 'Not detected'}")
+            _render_column_guide(profile)
+
+        _render_anchor(f"{dataset_anchor_base}-metric-guide")
+        with st.expander("Metric guide", expanded=False):
+            st.caption("These definitions help users understand what each suggested metric represents in business terms.")
+            _render_metric_definitions(default_bundle.get("metric_definitions", []))
+
+        benchmark_cards = analytics.benchmark_cards(
+            df,
+            primary_metric,
+            category_col=dimensions.get("category"),
+            date_col=dimensions.get("time"),
+        )
+        if benchmark_cards:
+            _render_anchor(f"{dataset_anchor_base}-benchmarks")
+            st.markdown("#### Benchmark Cards")
+            _render_benchmark_cards(benchmark_cards)
+
+        _render_anchor(f"{dataset_anchor_base}-full-table")
+        with st.expander("Full table", expanded=True):
+            st.caption("Showing the full cleaned dataset below. Scroll horizontally and vertically as needed.")
+            st.dataframe(df, use_container_width=True, height=620)
+            csv_bytes = df.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                f"Download cleaned CSV for {info['file_name']}",
+                data=csv_bytes,
+                file_name=f"{Path(info['file_name']).stem}_cleaned.csv",
+                mime="text/csv",
+                key=f"clean_csv_{file_id}",
+            )
+
+        if default_bundle["kpis"]:
+            _render_anchor(f"{dataset_anchor_base}-kpis")
+            st.markdown("#### KPI Snapshot")
+            _render_kpi_cards(default_bundle["kpis"], key_prefix=f"kpi_{file_id}", definitions=metric_definition_map, analytics=analytics)
+
+        if default_panels:
+            _render_anchor(f"{dataset_anchor_base}-best-dashboard")
+            st.markdown("#### Best Dashboard")
+            st.caption(
+                f"Recommended view for this {dataset_type} dataset uses metrics {', '.join(default_bundle['metrics'][:3]) or 'none'}, "
+                f"time dimension `{dimensions['time'] or 'not detected'}`, and category dimension `{dimensions['category'] or 'not detected'}`."
+            )
+            with st.expander("Why this dashboard was chosen", expanded=False):
+                _render_chart_reasons(default_bundle.get("chart_reasons", []))
+            _render_chart_panels(default_panels, dataset_id=file_id, section_key="best_dashboard")
+
+        _render_anchor(f"{dataset_anchor_base}-builder")
         _render_dataset_dashboard(
             df,
             analytics,
@@ -1230,44 +1813,51 @@ if selected:
             key_prefix=f"details_{file_id}",
             dataset_id=file_id,
         )
-        metric_col = analytics.find_best_column(df, ["revenue", "sales", "profit"])
-        if not metric_col:
-            st.warning("No numeric metric column found for this dataset.")
-            continue
 
-        metrics = analytics.compute_metrics(df, target_col=metric_col)
-        st.json(metrics)
-        trend = analytics.trend_chart(df, value_col=metric_col)
-        if trend:
-            st.plotly_chart(trend, use_container_width=True)
-        bar = analytics.comparison_chart(df, value_col=metric_col)
-        if bar:
-            st.plotly_chart(bar, use_container_width=True)
+        if primary_metric:
+            _render_anchor(f"{dataset_anchor_base}-anomalies")
+            st.markdown("#### Anomaly Review")
+            st.caption(
+                "Use grouped anomaly detection to review unusual ASINs, dates, or categories instead of only looking at individual rows."
+            )
+            _render_grouped_anomaly_review(df, analytics, default_bundle, file_id, primary_metric)
 
-        anomalies = analytics.detect_anomalies(df, metric_col)
-        st.write(f"Anomalies detected: {anomalies['count']}")
-        if anomalies["rows"]:
-            st.dataframe(pd.DataFrame(anomalies["rows"]), use_container_width=True)
-
+        metric_summary = analytics.compute_metrics(df, target_col=primary_metric) if primary_metric else {"rows": len(df), "columns": len(df.columns)}
         if ai_router.can_use_llm():
             ai_insight_prompt = (
                 f"Dataset: {info['file_name']}\n"
-                f"Metric column: {metric_col}\n"
-                f"Stats: {json.dumps(metrics)}\n"
-                f"Anomaly count: {anomalies['count']}\n"
-                "Provide 3 concise insights: trend, top category/pattern, and risk/anomaly."
+                f"Metric column: {primary_metric}\n"
+                f"Stats: {json.dumps(metric_summary)}\n"
+                f"Anomaly explanation: {grouped_anomalies.get('method', '')}\n"
+                "Provide 3 concise insights: what the table is about, what metric matters, and what risk/opportunity to check."
             )
             insight_text = ai_router.generate(ai_insight_prompt)
             if insight_text:
+                st.markdown("#### Plain-language summary")
                 st.write(insight_text)
         else:
-            st.write(_summarize_dataset_rule_based(info["file_name"], metrics, anomalies, analytics.insights(df)))
+            st.markdown("#### Plain-language summary")
+            st.write(_summarize_dataset_rule_based(info["file_name"], metric_summary, grouped_anomalies, analytics.insights(df)))
 
         export_name = f"analysis_{file_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
         export_path = str(EXPORT_DIR / export_name)
+        _render_anchor(f"{dataset_anchor_base}-exports")
+        st.markdown("#### Export Options")
+        if default_panels:
+            pdf_bytes = _dashboard_pdf_bytes(info["file_name"], default_panels)
+            if pdf_bytes:
+                st.download_button(
+                    f"Download dashboard PDF for {info['file_name']}",
+                    data=pdf_bytes,
+                    file_name=f"{Path(info['file_name']).stem}_dashboard.pdf",
+                    mime="application/pdf",
+                    key=f"dashboard_pdf_{file_id}",
+                )
+            else:
+                st.caption("Dashboard PDF export is unavailable until Plotly image export support is available in deployment.")
         try:
             insights = analytics.insights(df)
-            analytics.export_report(df, metrics, insights, export_path)
+            analytics.export_report(df, metric_summary, insights, export_path)
             with open(export_path, "rb") as f:
                 st.download_button(
                     f"Download report for {info['file_name']}",
