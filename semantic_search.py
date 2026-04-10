@@ -68,14 +68,31 @@ class SemanticSearchEngine:
             kind = filters["item_kind"]
             out = [r for r in out if r.get("item_kind", "file") == kind]
         if filters.get("keywords"):
-            wanted = set(filters["keywords"])
+            wanted = set([keyword.lower() for keyword in filters["keywords"]])
             filtered = []
             for r in out:
-                kws = set(json.loads(r.get("keywords", "[]")))
-                if wanted.intersection(kws):
+                kws = set([str(keyword).lower() for keyword in json.loads(r.get("keywords", "[]"))])
+                haystack = " ".join(
+                    [
+                        r.get("file_name", ""),
+                        r.get("path_text", ""),
+                        r.get("summary", ""),
+                        r.get("topic", ""),
+                    ]
+                ).lower()
+                if all((keyword in kws) or (keyword in haystack) for keyword in wanted):
                     filtered.append(r)
             out = filtered
         return out
+
+    def _name_search(self, query: str, item_kind: str | None = None, limit: int = 25) -> List[Dict]:
+        cleaned = query.strip().strip('"').strip("'")
+        if not cleaned:
+            return []
+        matches = self.indexer.search_by_name(cleaned, item_kind=item_kind, limit=limit)
+        exact = [row for row in matches if row.get("file_name", "").lower() == cleaned.lower()]
+        partial = [row for row in matches if row.get("file_name", "").lower() != cleaned.lower()]
+        return exact + partial
 
     def _rank_rows(self, query: str, rows: List[Dict], top_k: int) -> List[Dict]:
         if not rows:
@@ -113,13 +130,34 @@ class SemanticSearchEngine:
 
     def search(self, query: str, top_k: int = 10) -> List[Dict]:
         lower = query.lower().strip()
+        filters = self._extract_filters(query)
+        has_filters = any(
+            value not in [None, "", []]
+            for value in [filters.get("uploader"), filters.get("year"), filters.get("file_type"), filters.get("item_kind"), filters.get("keywords")]
+        )
+        filename_match = re.search(
+            r"(?:named|file name|filename|search file|find file|open file)\s+([a-zA-Z0-9_.() \-]+)",
+            lower,
+        )
+        if filename_match:
+            name_query = filename_match.group(1).strip(" .,!?:;")
+            results = self._name_search(name_query, item_kind="file", limit=max(top_k, 50))
+            self.memory.add_turn(query, [r["file_id"] for r in results])
+            self.memory.last_results = results
+            return results
+        if "." in query and any(ext in lower for ext in [".csv", ".xlsx", ".xls", ".pdf", ".docx", ".pptx", ".py"]):
+            results = self._name_search(query, item_kind=None, limit=max(top_k, 50))
+            if results:
+                self.memory.add_turn(query, [r["file_id"] for r in results])
+                self.memory.last_results = results
+                return results
         if any(phrase in lower for phrase in ["show folders", "list folders", "folders available", "what folders"]):
-            results = self.indexer.list_items("folder")[:top_k]
+            results = self.indexer.list_items("folder")[: max(top_k, 100)]
             self.memory.add_turn(query, [r["file_id"] for r in results])
             self.memory.last_results = results
             return results
         if any(phrase in lower for phrase in ["all files", "drive files", "list files", "show files", "what are the files"]):
-            results = self.indexer.list_items("file")[:top_k]
+            results = self.indexer.list_items("file")[: max(top_k, 100)]
             self.memory.add_turn(query, [r["file_id"] for r in results])
             self.memory.last_results = results
             return results
@@ -137,9 +175,10 @@ class SemanticSearchEngine:
             base = self.memory.last_results
             if not base:
                 return []
-            filters = self._extract_filters(query)
             return self.search_with_filters(query, filters, top_k=top_k, base_rows=base)
 
-        candidates = self.indexer.semantic_search(query, top_k=top_k)
-        filters = self._extract_filters(query)
+        if has_filters:
+            return self.search_with_filters(query, filters, top_k=max(top_k, 50), base_rows=None)
+
+        candidates = self.indexer.semantic_search(query, top_k=max(top_k, 50))
         return self.search_with_filters(query, filters, top_k=top_k, base_rows=candidates)

@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import re
+import zipfile
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List
@@ -771,6 +772,160 @@ def _render_chart_panels(panels: List[Dict], dataset_id: str, section_key: str) 
                     )
 
 
+def _safe_download_name(name: str, fallback: str) -> str:
+    cleaned = re.sub(r'[<>:"/\\\\|?*]+', "_", name).strip()
+    return cleaned or fallback
+
+
+def _build_renamed_zip(file_items: List[Dict], rename_map: Dict[str, str]) -> bytes:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+        for item in file_items:
+            local_path = item.get("local_path", "")
+            if not local_path or not Path(local_path).exists():
+                continue
+            target_name = _safe_download_name(rename_map.get(item["file_id"], item["file_name"]), item["file_name"])
+            zf.write(local_path, arcname=target_name)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+def _render_file_actions(indexer: MetadataIndexer, analytics: AnalyticsEngine) -> None:
+    st.subheader("File Actions")
+    all_files = indexer.list_items("file")
+    if not all_files:
+        st.caption("No indexed files available yet.")
+        return
+
+    with st.expander("Rename, Download, Analyze, or Merge Files", expanded=False):
+        file_options = [f"{item['file_id']} | {item['file_name']}" for item in all_files]
+        selected_files = st.multiselect("Select one or more files", options=file_options, key="file_actions_selection")
+        selected_items = []
+        selected_ids = []
+        for option in selected_files:
+            file_id = option.split("|")[0].strip()
+            info = indexer.get_file(file_id)
+            if info:
+                selected_items.append(info)
+                selected_ids.append(file_id)
+
+        rename_tab, analysis_tab = st.tabs(["Rename & Download", "Multi-file Analysis"])
+
+        with rename_tab:
+            if not selected_items:
+                st.caption("Select files above to rename or download them.")
+            else:
+                monitor = DriveMonitor()
+                rename_map: Dict[str, str] = {}
+                for item in selected_items:
+                    default_name = monitor.suggest_clean_name(item["file_name"], item.get("item_kind", "file"))
+                    rename_map[item["file_id"]] = st.text_input(
+                        f"New name for {item['file_name']}",
+                        value=default_name,
+                        key=f"rename_input_{item['file_id']}",
+                    )
+
+                if len(selected_items) == 1:
+                    item = selected_items[0]
+                    local_path = item.get("local_path", "")
+                    if local_path and Path(local_path).exists():
+                        with open(local_path, "rb") as handle:
+                            st.download_button(
+                                "Download renamed file",
+                                data=handle.read(),
+                                file_name=_safe_download_name(rename_map[item["file_id"]], item["file_name"]),
+                                key=f"download_renamed_single_{item['file_id']}",
+                            )
+                else:
+                    zip_bytes = _build_renamed_zip(selected_items, rename_map)
+                    st.download_button(
+                        "Download renamed files as ZIP",
+                        data=zip_bytes,
+                        file_name="renamed_files.zip",
+                        mime="application/zip",
+                        key="download_renamed_zip",
+                    )
+
+                if st.session_state["data_source"] == "google_drive":
+                    if st.button("Apply these names in Google Drive", key="apply_custom_drive_renames"):
+                        monitor = DriveMonitor()
+                        rename_plan = []
+                        for item in selected_items:
+                            new_name = rename_map.get(item["file_id"], item["file_name"]).strip()
+                            if new_name and new_name != item["file_name"]:
+                                rename_plan.append(
+                                    {
+                                        "file_id": item["file_id"],
+                                        "item_kind": item.get("item_kind", "file"),
+                                        "old_name": item["file_name"],
+                                        "new_name": new_name,
+                                        "will_change": True,
+                                    }
+                                )
+                        if not rename_plan:
+                            st.info("No actual file-name changes were entered.")
+                        else:
+                            applied = monitor.apply_rename_plan(rename_plan)
+                            if applied:
+                                st.success(f"Applied {len(applied)} Drive renames. Run sync once to refresh the index.")
+                            else:
+                                st.warning("No Drive renames were applied. This usually means the service account lacks edit access.")
+
+        with analysis_tab:
+            tabular_items = [
+                item for item in selected_items if Path(item.get("local_path", "")).suffix.lower() in [".csv", ".xlsx", ".xls"]
+            ]
+            if not tabular_items:
+                st.caption("Select one or more CSV/Excel files above to analyze or merge them.")
+            else:
+                if st.button("Use selected files for analysis", key="load_selected_file_actions_context"):
+                    st.session_state["last_selected_files"] = selected_ids
+                    st.session_state["selected_items"] = list(dict.fromkeys(st.session_state["selected_items"] + selected_ids))
+                    st.success("Selected files loaded into the current analysis context below.")
+                    st.rerun()
+
+                if len(tabular_items) >= 2:
+                    merge_mode = st.selectbox(
+                        "Merge mode",
+                        options=["Append rows", "Only common columns"],
+                        key="merge_mode_select",
+                    )
+                    merge_datasets = []
+                    for item in tabular_items:
+                        try:
+                            merge_datasets.append({"file_name": item["file_name"], "df": analytics.load_dataset(item["local_path"])})
+                        except Exception:
+                            continue
+                    if merge_datasets:
+                        merged_df = analytics.combine_datasets(merge_datasets)
+                        if merge_mode == "Only common columns" and not merged_df.empty:
+                            common_cols = set(merge_datasets[0]["df"].columns)
+                            for dataset in merge_datasets[1:]:
+                                common_cols &= set(dataset["df"].columns)
+                            if common_cols:
+                                ordered_cols = [col for col in merged_df.columns if col in common_cols or col == "source_file"]
+                                merged_df = merged_df[ordered_cols]
+                        st.caption(f"Merged preview across {len(merge_datasets)} files")
+                        st.dataframe(merged_df.head(50), use_container_width=True)
+                        st.download_button(
+                            "Download merged CSV",
+                            data=merged_df.to_csv(index=False).encode("utf-8"),
+                            file_name="merged_analysis.csv",
+                            mime="text/csv",
+                            key="download_merged_csv",
+                        )
+                        merged_xlsx = io.BytesIO()
+                        with pd.ExcelWriter(merged_xlsx, engine="openpyxl") as writer:
+                            merged_df.to_excel(writer, index=False, sheet_name="MergedData")
+                        st.download_button(
+                            "Download merged Excel",
+                            data=merged_xlsx.getvalue(),
+                            file_name="merged_analysis.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            key="download_merged_xlsx",
+                        )
+
+
 def _save_builder_preset_ui(
     preset_scope: str,
     dataset_ids: List[str],
@@ -1420,6 +1575,9 @@ with st.expander("Current context", expanded=False):
 
 st.divider()
 _render_drive_explorer(indexer)
+
+st.divider()
+_render_file_actions(indexer, analytics)
 
 st.subheader("Chat")
 _show_chat_history()
