@@ -26,117 +26,13 @@ from config import DASHBOARD_PRESETS_PATH, EXPORT_DIR, settings
 from metadata_indexer import MetadataIndexer
 from monitor_drive import DriveMonitor
 from semantic_search import SemanticSearchEngine
+from styles import inject_styles
 
 
 st.set_page_config(page_title="Drive AI Assistant", layout="wide")
 st.title("Drive AI Assistant")
 st.caption("Conversational Drive intelligence with memory, analytics, and exports")
-st.markdown(
-    """
-    <style>
-    .dataset-toolbar {
-        position: sticky;
-        top: 0.5rem;
-        z-index: 20;
-        background: linear-gradient(135deg, #f7fbff 0%, #eef7f2 100%);
-        border: 1px solid #d9e8dd;
-        border-radius: 14px;
-        padding: 0.85rem 1rem;
-        margin: 0.25rem 0 1rem 0;
-        box-shadow: 0 8px 20px rgba(30, 60, 90, 0.08);
-    }
-    .dataset-toolbar-title {
-        font-weight: 700;
-        font-size: 1rem;
-        color: #16324f;
-        margin-bottom: 0.2rem;
-    }
-    .dataset-toolbar-meta {
-        color: #486581;
-        font-size: 0.92rem;
-        line-height: 1.35;
-    }
-    .dataset-mini-nav {
-        position: sticky;
-        top: 5.4rem;
-        z-index: 19;
-        background: rgba(255,255,255,0.92);
-        border: 1px solid #d8e4ef;
-        border-radius: 12px;
-        padding: 0.5rem 0.8rem;
-        margin: 0 0 1rem 0;
-        backdrop-filter: blur(6px);
-    }
-    .dataset-mini-nav summary {
-        cursor: pointer;
-        font-weight: 700;
-        color: #17324d;
-        margin-bottom: 0.25rem;
-    }
-    .dataset-mini-nav a {
-        display: inline-block;
-        margin: 0.2rem 0.6rem 0.2rem 0;
-        color: #245c8a;
-        text-decoration: none;
-        font-size: 0.9rem;
-        font-weight: 600;
-    }
-    .dataset-mini-nav a:hover {
-        text-decoration: underline;
-    }
-    .benchmark-grid {
-        display: grid;
-        grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-        gap: 0.75rem;
-        margin: 0.35rem 0 1rem 0;
-    }
-    .benchmark-card {
-        border-radius: 14px;
-        padding: 0.9rem 1rem;
-        border: 1px solid rgba(0,0,0,0.06);
-        box-shadow: 0 8px 18px rgba(20, 34, 51, 0.06);
-    }
-    .benchmark-card.good {
-        background: linear-gradient(135deg, #f2fff7 0%, #e4f9ea 100%);
-        border-color: #b8e3c4;
-    }
-    .benchmark-card.warn {
-        background: linear-gradient(135deg, #fff6f2 0%, #fde7df 100%);
-        border-color: #f0c4b4;
-    }
-    .benchmark-card.neutral {
-        background: linear-gradient(135deg, #f8fbff 0%, #eef3fb 100%);
-        border-color: #d8e2f1;
-    }
-    .benchmark-label {
-        font-size: 0.8rem;
-        font-weight: 700;
-        text-transform: uppercase;
-        letter-spacing: 0.04em;
-        color: #5a6c7d;
-        margin-bottom: 0.25rem;
-    }
-    .benchmark-value {
-        font-size: 1.05rem;
-        font-weight: 700;
-        color: #16212f;
-        margin-bottom: 0.15rem;
-    }
-    .benchmark-delta {
-        font-size: 0.95rem;
-        font-weight: 700;
-        color: #1f3c56;
-        margin-bottom: 0.25rem;
-    }
-    .benchmark-detail {
-        font-size: 0.85rem;
-        color: #52606d;
-        line-height: 1.3;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+inject_styles()
 
 
 @st.cache_resource
@@ -147,7 +43,43 @@ def get_services():
     return indexer, search, analytics
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def _cached_load_dataset(local_path: str, max_rows: int = 50_000) -> pd.DataFrame:
+    """Cache loaded DataFrames for 5 minutes keyed by file path.
+
+    Using a module-level cached function (not a method) so Streamlit can
+    serialize the cache key without touching the AnalyticsEngine instance.
+    Re-uses the singleton analytics engine from get_services().
+    """
+    _, _, analytics = get_services()
+    return analytics.load_dataset(local_path, max_rows=max_rows)
+
+
 def init_session() -> None:
+    """Initialise all session state keys with safe defaults.
+
+    Session state schema (all keys documented here for future maintainers):
+      chat_history        List[Dict]    — chat messages {role, content, ...}
+      chat_turn_counter   int           — increments per user turn; used for widget key namespacing
+      last_results        List[Dict]    — file rows from the most recent search
+      last_selected_files List[str]     — file IDs chosen for the active analysis context
+      selected_items      List[str]     — persistent basket of file IDs across turns
+      latest_results      List[Dict]    — alias kept for analytics tab compatibility
+      latest_compare_df   DataFrame|None— cross-file comparison table from last compare action
+      data_source         str           — "google_drive" | "demo" | "unknown"
+      data_source_detail  str           — human-readable explanation of data source
+      data_bootstrap_done bool          — prevents repeated bootstrap on every rerun
+      rename_preview      List[Dict]    — pending rename plan rows
+      executive_brief     Dict|None     — last generated executive brief payload
+      latest_alerts       List[Dict]    — last generated business alert rows
+      business_role       str           — active role (leadership/sales/finance/marketing/operations)
+      llm_enabled         bool          — sidebar toggle for paid LLM usage
+      llm_provider        str           — active LLM provider name
+      explorer_folder_id  str           — folder ID open in Folder Explorer tab
+      selected_preset_name str          — name of the active dashboard preset
+      dataset_selection   List[str]     — multiselect widget value for dataset picker
+      last_sync_time      datetime|None — UTC timestamp of last Drive sync (enforces 5-min TTL)
+    """
     st.session_state.setdefault("chat_history", [])
     st.session_state.setdefault("chat_turn_counter", 0)
     st.session_state.setdefault("last_results", [])
@@ -166,6 +98,9 @@ def init_session() -> None:
     st.session_state.setdefault("explorer_folder_id", "")
     st.session_state.setdefault("selected_preset_name", "")
     st.session_state.setdefault("dataset_selection", [])
+    st.session_state.setdefault("last_sync_time", None)
+    st.session_state.setdefault("llm_call_count", 0)
+    st.session_state.setdefault("llm_token_estimate", 0)
     default_provider = settings.ai_provider
     if default_provider == "openai" and not settings.openai_api_key and settings.anthropic_api_key:
         default_provider = "anthropic"
@@ -390,10 +325,9 @@ def _load_context_datasets(
         suffix = Path(info.get("local_path", "")).suffix.lower()
         if suffix not in [".csv", ".xlsx", ".xls"]:
             continue
-        try:
-            datasets.append({"file_name": info["file_name"], "df": analytics.load_dataset(info["local_path"]), "info": info})
-        except Exception:
-            continue
+        df = _cached_load_dataset(info["local_path"])
+        if not df.empty:
+            datasets.append({"file_name": info["file_name"], "df": df, "info": info})
     return datasets
 
 
@@ -892,10 +826,9 @@ def _render_file_actions(indexer: MetadataIndexer, analytics: AnalyticsEngine) -
                     )
                     merge_datasets = []
                     for item in tabular_items:
-                        try:
-                            merge_datasets.append({"file_name": item["file_name"], "df": analytics.load_dataset(item["local_path"])})
-                        except Exception:
-                            continue
+                        df = _cached_load_dataset(item["local_path"])
+                        if not df.empty:
+                            merge_datasets.append({"file_name": item["file_name"], "df": df})
                     if merge_datasets:
                         merged_df = analytics.combine_datasets(merge_datasets)
                         if merge_mode == "Only common columns" and not merged_df.empty:
@@ -1430,6 +1363,15 @@ with st.sidebar:
     )
     st.session_state["llm_provider"] = llm_provider
     st.write(f"Provider: `{st.session_state['llm_provider']}`")
+    if st.session_state["llm_call_count"] > 0:
+        _tok = st.session_state["llm_token_estimate"]
+        st.caption(
+            f"Session LLM usage: {st.session_state['llm_call_count']} calls, "
+            f"~{_tok:,} tokens (est.)"
+        )
+        if st.button("Reset usage counter"):
+            st.session_state["llm_call_count"] = 0
+            st.session_state["llm_token_estimate"] = 0
     role = st.selectbox(
         "Business role",
         options=["leadership", "sales", "finance", "marketing", "operations"],
@@ -1450,11 +1392,18 @@ with st.sidebar:
         f"Drive credentials: `{'loaded' if bool(settings.google_service_account_json or settings.google_service_account_file) else 'missing'}` | "
         f"Web search: `{'loaded' if bool(settings.tavily_api_key) else 'missing'}`"
     )
+    last_sync = st.session_state.get("last_sync_time")
+    if last_sync:
+        mins_ago = int((datetime.utcnow() - last_sync).total_seconds() // 60)
+        st.caption(f"Last synced {mins_ago} min ago. Data stays current until you sync again.")
     if st.button("Run Monitor Once"):
         try:
             with st.spinner("Syncing Drive folder..."):
                 monitor = DriveMonitor()
                 changes = monitor.run_once()
+            st.session_state["last_sync_time"] = datetime.utcnow()
+            # Invalidate any cached datasets after a sync so stale data is not served.
+            _cached_load_dataset.clear()
             st.success(
                 f"Sync done. New={len(changes['new'])}, Modified={len(changes['modified'])}, Deleted={len(changes['deleted'])}"
             )
@@ -1510,7 +1459,12 @@ with st.sidebar:
             st.success("Preset deleted.")
             st.rerun()
 
-ai_router = AIRouter(st.session_state["llm_provider"], enabled=st.session_state["llm_enabled"])
+ai_router = AIRouter(
+    st.session_state["llm_provider"],
+    enabled=st.session_state["llm_enabled"],
+    prior_calls=st.session_state.get("llm_call_count", 0),
+    prior_tokens=st.session_state.get("llm_token_estimate", 0),
+)
 
 if st.session_state["data_source"] == "google_drive":
     st.success("Using Google Drive data")
@@ -1699,6 +1653,10 @@ if user_query:
         if not results:
             assistant_text = "No matching Drive items found. Try a folder name, file name, uploader, or keyword."
 
+    # Persist LLM usage counters back to session state so they survive reruns.
+    st.session_state["llm_call_count"] = ai_router._calls
+    st.session_state["llm_token_estimate"] = ai_router._tokens
+
     turn_id = st.session_state["chat_turn_counter"] + 1
     st.session_state["chat_turn_counter"] = turn_id
     assistant_turn = {
@@ -1737,9 +1695,12 @@ if user_query:
                     "Give concise insights from these files: top themes, trends, and anomalies to inspect.\n"
                     f"{json.dumps(compact, indent=2)}"
                 )
-                ai_summary = ai_router.generate(ai_prompt)
+                # Use streaming so tokens appear progressively instead of all at once.
+                ai_summary = st.write_stream(ai_router.generate_stream(ai_prompt))
+                # Track usage after streaming (streaming doesn't go through generate()).
                 if ai_summary:
-                    st.write(ai_summary)
+                    st.session_state["llm_call_count"] += 1
+                    st.session_state["llm_token_estimate"] += (len(ai_prompt) + len(ai_summary)) // 4
             else:
                 st.write(_summarize_results_rule_based(st.session_state["latest_results"]))
 

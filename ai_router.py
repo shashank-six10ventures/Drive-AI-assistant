@@ -1,8 +1,24 @@
+"""
+ai_router.py — Multi-provider LLM routing and external data integrations.
+
+Responsibilities (in order of concern):
+  1. Provider routing     — selects Anthropic/OpenAI/Groq/Gemini/HuggingFace based on config
+  2. Intent parsing       — extracts structured intent from natural-language queries
+  3. Amazon search        — scrapes Amazon marketplace listings (BeautifulSoup, brittle)
+  4. Web search           — calls Tavily API for general web results
+
+Error contract:
+  generate()         returns "" on failure (missing key or API error); callers check for falsy
+  parse_query_intent() always returns a dict; falls back to heuristic if LLM unavailable
+  search_web()       returns [] on failure
+  search_amazon()    returns [] on failure
+"""
 from __future__ import annotations
 
 import json
+import logging
 import re
-from typing import Optional
+from typing import Dict, Generator, List, Optional
 
 import requests
 from bs4 import BeautifulSoup
@@ -11,9 +27,12 @@ from config import settings
 
 
 class AIRouter:
-    def __init__(self, provider: Optional[str] = None, enabled: bool = True):
+    def __init__(self, provider: Optional[str] = None, enabled: bool = True, prior_calls: int = 0, prior_tokens: int = 0):
         self.provider = (provider or settings.ai_provider).lower()
         self.enabled = enabled
+        # Usage counters — seeded from session state so they persist across Streamlit reruns.
+        self._calls: int = prior_calls
+        self._tokens: int = prior_tokens
 
     def can_use_llm(self) -> bool:
         if not self.enabled:
@@ -33,6 +52,16 @@ class AIRouter:
     def generate(self, prompt: str, system_prompt: str = "You are a helpful data analyst AI.") -> str:
         if not self.enabled:
             return ""
+        if not self.can_use_llm():
+            return ""
+        result = self._dispatch(prompt, system_prompt)
+        if result:
+            self._calls += 1
+            self._tokens += (len(prompt) + len(result)) // 4  # rough 4-chars-per-token estimate
+        return result
+
+    def _dispatch(self, prompt: str, system_prompt: str) -> str:
+        """Route to the correct provider. Called only when LLM is enabled and key is present."""
         if self.provider in ["anthropic", "claude"]:
             return self._anthropic(prompt, system_prompt)
         if self.provider == "openai":
@@ -43,7 +72,63 @@ class AIRouter:
             return self._gemini(prompt, system_prompt)
         if self.provider == "huggingface":
             return self._huggingface(prompt)
-        return "AI provider not configured. Falling back to rule-based output."
+        return ""
+
+    def generate_stream(self, prompt: str, system_prompt: str = "You are a helpful data analyst AI.") -> Generator[str, None, None]:
+        """Stream LLM response tokens as they arrive.
+
+        Yields text chunks progressively. Only Anthropic supports true streaming;
+        other providers fall back to a single yielded response (still works with
+        st.write_stream but without the token-by-token effect).
+        """
+        if not self.enabled or not self.can_use_llm():
+            return
+        if self.provider in ["anthropic", "claude"]:
+            yield from self._anthropic_stream(prompt, system_prompt)
+        else:
+            # Non-streaming fallback: yields the full response as one chunk.
+            result = self.generate(prompt, system_prompt)
+            if result:
+                yield result
+
+    def _anthropic_stream(self, prompt: str, system_prompt: str) -> Generator[str, None, None]:
+        if not settings.anthropic_api_key:
+            return
+        url = "https://api.anthropic.com/v1/messages"
+        payload = {
+            "model": settings.anthropic_model,
+            "max_tokens": 800,
+            "stream": True,
+            "system": system_prompt,
+            "messages": [{"role": "user", "content": prompt}],
+        }
+        headers = {
+            "x-api-key": settings.anthropic_api_key,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        }
+        try:
+            with requests.post(url, headers=headers, json=payload, stream=True, timeout=60) as response:
+                response.raise_for_status()
+                for raw_line in response.iter_lines():
+                    if not raw_line:
+                        continue
+                    line = raw_line if isinstance(raw_line, str) else raw_line.decode("utf-8")
+                    if not line.startswith("data: "):
+                        continue
+                    data_str = line[6:].strip()
+                    if data_str == "[DONE]":
+                        break
+                    try:
+                        event = json.loads(data_str)
+                    except json.JSONDecodeError:
+                        continue
+                    if event.get("type") == "content_block_delta":
+                        chunk = event.get("delta", {}).get("text", "")
+                        if chunk:
+                            yield chunk
+        except Exception as exc:
+            logging.warning("Anthropic streaming failed: %s", exc)
 
     def parse_query_intent(self, query: str) -> dict:
         if not self.can_use_llm():
@@ -79,7 +164,8 @@ class AIRouter:
             response.raise_for_status()
             data = response.json()
             return data.get("results", [])
-        except Exception:
+        except Exception as exc:
+            logging.warning("Web search failed: %s", exc)
             return []
 
     def search_amazon(self, query: str, marketplace: Optional[str] = None) -> list[dict]:
@@ -123,7 +209,8 @@ class AIRouter:
                     }
                 )
             return results
-        except Exception:
+        except Exception as exc:
+            logging.warning("Amazon search failed: %s", exc)
             return []
 
     def _heuristic_intent(self, query: str) -> dict:
@@ -199,7 +286,7 @@ class AIRouter:
 
     def _openai(self, prompt: str, system_prompt: str) -> str:
         if not settings.openai_api_key:
-            return "OPENAI_API_KEY not set."
+            return ""
         try:
             url = "https://api.openai.com/v1/chat/completions"
             payload = {
@@ -218,11 +305,12 @@ class AIRouter:
             response.raise_for_status()
             return response.json()["choices"][0]["message"]["content"].strip()
         except Exception as exc:
-            return f"OpenAI request failed: {exc}"
+            logging.warning("OpenAI request failed: %s", exc)
+            return ""
 
     def _anthropic(self, prompt: str, system_prompt: str) -> str:
         if not settings.anthropic_api_key:
-            return "ANTHROPIC_API_KEY not set."
+            return ""
         try:
             url = "https://api.anthropic.com/v1/messages"
             payload = {
@@ -245,11 +333,12 @@ class AIRouter:
             text_parts = [part.get("text", "") for part in parts if part.get("type") == "text"]
             return "\n".join(text_parts).strip()
         except Exception as exc:
-            return f"Anthropic request failed: {exc}"
+            logging.warning("Anthropic request failed: %s", exc)
+            return ""
 
     def _groq(self, prompt: str, system_prompt: str) -> str:
         if not settings.groq_api_key:
-            return "GROQ_API_KEY not set."
+            return ""
         try:
             url = "https://api.groq.com/openai/v1/chat/completions"
             payload = {
@@ -268,11 +357,12 @@ class AIRouter:
             response.raise_for_status()
             return response.json()["choices"][0]["message"]["content"].strip()
         except Exception as exc:
-            return f"Groq request failed: {exc}"
+            logging.warning("Groq request failed: %s", exc)
+            return ""
 
     def _gemini(self, prompt: str, system_prompt: str) -> str:
         if not settings.gemini_api_key:
-            return "GEMINI_API_KEY not set."
+            return ""
         try:
             url = (
                 "https://generativelanguage.googleapis.com/v1beta/models/"
@@ -288,15 +378,16 @@ class AIRouter:
             data = response.json()
             candidates = data.get("candidates", [])
             if not candidates:
-                return "Gemini returned no content."
+                return ""
             parts = candidates[0].get("content", {}).get("parts", [])
             return "\n".join([p.get("text", "") for p in parts]).strip()
         except Exception as exc:
-            return f"Gemini request failed: {exc}"
+            logging.warning("Gemini request failed: %s", exc)
+            return ""
 
     def _huggingface(self, prompt: str) -> str:
         if not settings.huggingface_api_key:
-            return "HUGGINGFACE_API_KEY not set."
+            return ""
         try:
             url = f"https://api-inference.huggingface.co/models/{settings.huggingface_model}"
             headers = {"Authorization": f"Bearer {settings.huggingface_api_key}"}
@@ -308,4 +399,5 @@ class AIRouter:
                 return data[0]["generated_text"].strip()
             return json.dumps(data, indent=2)
         except Exception as exc:
-            return f"HuggingFace request failed: {exc}"
+            logging.warning("HuggingFace request failed: %s", exc)
+            return ""

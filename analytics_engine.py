@@ -1,5 +1,19 @@
+"""
+analytics_engine.py — Dataset profiling, aggregation, visualization, and business analytics.
+
+Key responsibilities:
+  load_dataset()            — reads CSV/Excel with a row cap (default 50 000) and cleans data
+  dataset_profile()         — detects numeric, categorical, and datetime columns
+  infer_dataset_type()      — classifies dataset as amazon/sales/marketing/inventory/general
+  aggregate_metrics()       — groupby with sum/mean/median/min/max/count
+  detect_anomalies()        — IQR-based outlier detection on raw rows
+  detect_grouped_anomalies()— IQR-based detection on aggregated groups
+  build_kpi_snapshot()      — quick top-line business metrics dict
+  dashboard_panels()        — returns a list of Plotly figures for the dashboard builder
+"""
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 import re
 from typing import Dict, List, Optional
@@ -180,16 +194,24 @@ class AnalyticsEngine:
             return f"Chosen because it shows how {metric_label} is distributed across the dataset."
         return f"Chosen to summarize {metric_label} using `{agg}` aggregation."
 
-    def load_dataset(self, local_path: str) -> pd.DataFrame:
+    def load_dataset(self, local_path: str, max_rows: int = 50_000) -> pd.DataFrame:
         path = Path(local_path)
+        if not path.exists():
+            logging.warning("Dataset file not found: %s", local_path)
+            return pd.DataFrame()
         suffix = path.suffix.lower()
-        if suffix == ".csv":
-            df = pd.read_csv(path)
-            return self.clean_dataframe(df)
-        if suffix in [".xlsx", ".xls"]:
-            df = pd.read_excel(path)
-            return self.clean_dataframe(df)
-        raise ValueError(f"Unsupported dataset type for analytics: {suffix}")
+        try:
+            if suffix == ".csv":
+                df = pd.read_csv(path, nrows=max_rows)
+                return self.clean_dataframe(df)
+            if suffix in [".xlsx", ".xls"]:
+                df = pd.read_excel(path, nrows=max_rows)
+                return self.clean_dataframe(df)
+            logging.warning("Unsupported dataset type: %s", suffix)
+            return pd.DataFrame()
+        except Exception as exc:
+            logging.warning("Failed to load dataset %s: %s", local_path, exc)
+            return pd.DataFrame()
 
     def clean_dataframe(self, df: pd.DataFrame) -> pd.DataFrame:
         local = df.copy()

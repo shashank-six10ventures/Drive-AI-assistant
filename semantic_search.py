@@ -1,9 +1,21 @@
+"""
+semantic_search.py — Query parsing, intent extraction, and ranked file retrieval.
+
+Despite the name, the primary ranking strategy is *lexical* (token overlap scoring)
+with semantic (embedding) similarity used only as an initial candidate pool when no
+structural filters are present. The module is named for its original intent and has
+been kept stable to avoid breaking imports.
+
+Key classes:
+  ConversationMemory  — stores prior query results for follow-up ("from these, ...")
+  SemanticSearchEngine — main search entry point; call search(query) from the UI
+"""
 from __future__ import annotations
 
 import json
 import re
 from dataclasses import dataclass, field
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 from metadata_indexer import MetadataIndexer
 
@@ -80,7 +92,7 @@ class SemanticSearchEngine:
                         r.get("topic", ""),
                     ]
                 ).lower()
-                if all((keyword in kws) or (keyword in haystack) for keyword in wanted):
+                if any((keyword in kws) or (keyword in haystack) for keyword in wanted):
                     filtered.append(r)
             out = filtered
         return out
@@ -95,6 +107,13 @@ class SemanticSearchEngine:
         return exact + partial
 
     def _rank_rows(self, query: str, rows: List[Dict], top_k: int) -> List[Dict]:
+        """Rank rows by combining lexical token overlap with stored embedding similarity.
+
+        Lexical matches are strong precision signals (exact keyword hits).
+        Embedding score (0-1 cosine similarity) provides a base ranking for
+        rows that lack direct keyword overlap. Combining both gives better
+        results than either signal alone.
+        """
         if not rows:
             return []
         q_tokens = [token for token in re.split(r"\W+", query.lower()) if token]
@@ -110,7 +129,11 @@ class SemanticSearchEngine:
                 ]
             ).lower()
             lexical_score = sum(1 for token in q_tokens if token in haystack)
-            ranked.append((lexical_score, row))
+            # embedding score is pre-computed cosine similarity (0.0–1.0), present when
+            # the row came through semantic_search(); defaults to 0 for filter-only paths.
+            embedding_score = float(row.get("score", 0.0))
+            combined = lexical_score + embedding_score
+            ranked.append((combined, row))
         ranked.sort(key=lambda item: (item[0], item[1].get("updated_at", "")), reverse=True)
         return [row for _, row in ranked[:top_k]]
 

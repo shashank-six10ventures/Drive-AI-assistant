@@ -1,6 +1,22 @@
+"""
+metadata_indexer.py — SQLite-backed file metadata store with embedding-based search.
+
+Storage:
+  files          — indexed file/folder metadata + embeddings (WAL mode for concurrent reads)
+  monitor_state  — tracks Drive file IDs and modification timestamps for change detection
+
+Embedding backends:
+  "sentence_transformers" — high quality, slow startup (for server deployments)
+  "hashing"              — fast, lightweight (default; uses HashingVectorizer with 256 features)
+
+Dummy data:
+  seed_dummy_data_if_empty() seeds demo datasets when the DB is empty and no Drive is connected.
+  ensure_dummy_data_ready()  repairs stale demo state where DB rows exist but local files are gone.
+"""
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 from io import BytesIO
 from dataclasses import dataclass
@@ -39,6 +55,9 @@ class MetadataIndexer:
     def __init__(self):
         self.conn = sqlite3.connect(DB_PATH, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
+        # WAL mode allows concurrent reads without blocking writes, improving
+        # Streamlit's multi-rerun safety without needing per-call locking.
+        self.conn.execute("PRAGMA journal_mode=WAL")
         self.embedding_backend = settings.embedding_backend
         self.vectorizer = HashingVectorizer(n_features=256, alternate_sign=False, norm=None)
         self.model = None
@@ -375,6 +394,13 @@ class MetadataIndexer:
         for row in rows:
             emb = np.array(json.loads(row["embedding_json"]))
             if emb.shape != q_emb.shape:
+                logging.warning(
+                    "Skipping file %s in semantic search: embedding shape %s does not match query shape %s. "
+                    "Re-index this file to fix.",
+                    row["file_id"],
+                    emb.shape,
+                    q_emb.shape,
+                )
                 continue
             sim = float(np.dot(q_emb, emb) / (np.linalg.norm(q_emb) * np.linalg.norm(emb) + 1e-9))
             scored.append((sim, dict(row)))
