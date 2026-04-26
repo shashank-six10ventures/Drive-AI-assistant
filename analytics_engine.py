@@ -262,21 +262,27 @@ class AnalyticsEngine:
 
     def dataset_profile(self, df: pd.DataFrame) -> Dict:
         numeric_cols = [str(col) for col in df.select_dtypes(include="number").columns.tolist()]
-        categorical_cols = [str(col) for col in df.columns if str(col) not in numeric_cols]
+        # Only non-numeric columns can be datetime or categorical dimensions
+        non_numeric_cols = [str(col) for col in df.columns if str(col) not in numeric_cols]
         datetime_cols = []
-        for col in df.columns:
-            col_name = str(col)
-            if "date" in col_name.lower() or "month" in col_name.lower() or "year" in col_name.lower():
+        for col_name in non_numeric_cols:
+            # Quick name-based check first (no parsing needed)
+            lower = col_name.lower()
+            if "date" in lower or "month" in lower or "year" in lower or "week" in lower or "quarter" in lower:
                 datetime_cols.append(col_name)
                 continue
+            # Try parsing — suppress the noisy "could not infer format" warning
+            import warnings
             try:
-                converted = pd.to_datetime(df[col], errors="coerce")
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    converted = pd.to_datetime(df[col_name], errors="coerce")
                 if converted.notna().mean() > 0.7:
                     datetime_cols.append(col_name)
             except Exception:
                 continue
         datetime_cols = list(dict.fromkeys(datetime_cols))
-        categorical_cols = [col for col in categorical_cols if col not in datetime_cols]
+        categorical_cols = [col for col in non_numeric_cols if col not in datetime_cols]
         metric_suggestions = [
             col
             for col in numeric_cols
@@ -486,10 +492,13 @@ class AnalyticsEngine:
         if not group_col or group_col not in df.columns:
             return pd.DataFrame([{metric: getattr(df[metric], agg)() if hasattr(df[metric], agg) else df[metric].sum() for metric in valid_metrics}])
 
+        import warnings
         local = df.copy()
         if group_col:
             if group_col.lower().endswith("date") or "month" in group_col.lower() or "year" in group_col.lower():
-                converted = pd.to_datetime(local[group_col], errors="coerce")
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    converted = pd.to_datetime(local[group_col], errors="coerce")
                 if converted.notna().any():
                     local[group_col] = converted.dt.strftime("%Y-%m-%d")
         grouped = local.groupby(group_col, dropna=False)[valid_metrics]
@@ -778,7 +787,6 @@ class AnalyticsEngine:
             if not grouped.empty and metric_col in grouped.columns:
                 ranked = grouped.sort_values(metric_col, ascending=False).reset_index(drop=True)
                 best_row = ranked.iloc[0]
-                weakest_row = ranked.iloc[-1]
                 cards.append(
                     {
                         "label": f"Best {self.humanize_label(category_col)}",
@@ -788,15 +796,19 @@ class AnalyticsEngine:
                         "detail": f"Highest total {self.humanize_label(metric_col)}",
                     }
                 )
-                cards.append(
-                    {
-                        "label": f"Weakest {self.humanize_label(category_col)}",
-                        "value": str(weakest_row[category_col]),
-                        "metric": metric_col,
-                        "formatted": self.format_metric_value(metric_col, weakest_row[metric_col]),
-                        "detail": f"Lowest total {self.humanize_label(metric_col)}",
-                    }
-                )
+                # Only show a "Weakest" card when there are at least 2 categories;
+                # with 1 row, best == weakest and the card would be misleading.
+                if len(ranked) >= 2:
+                    weakest_row = ranked.iloc[-1]
+                    cards.append(
+                        {
+                            "label": f"Weakest {self.humanize_label(category_col)}",
+                            "value": str(weakest_row[category_col]),
+                            "metric": metric_col,
+                            "formatted": self.format_metric_value(metric_col, weakest_row[metric_col]),
+                            "detail": f"Lowest total {self.humanize_label(metric_col)}",
+                        }
+                    )
 
         if date_col and date_col in df.columns:
             trend = self.aggregate_metrics(df, [metric_col], group_col=date_col, agg="sum")
@@ -807,22 +819,30 @@ class AnalyticsEngine:
                 if len(local) >= 2:
                     local["_change"] = local[metric_col].diff()
                     fastest = local.loc[local["_change"].idxmax()] if local["_change"].notna().any() else None
-                    if fastest is not None and pd.notna(fastest["_change"]):
+                    if fastest is not None and pd.notna(fastest["_change"]) and pd.notna(fastest[date_col]):
+                        try:
+                            date_str = str(fastest[date_col].date())
+                        except (AttributeError, TypeError):
+                            date_str = str(fastest[date_col])
                         cards.append(
                             {
                                 "label": f"Fastest Growth {self.humanize_label(date_col)}",
-                                "value": str(fastest[date_col].date()),
+                                "value": date_str,
                                 "metric": metric_col,
                                 "formatted": self.format_metric_value(metric_col, fastest["_change"]),
                                 "detail": f"Largest period-over-period increase in {self.humanize_label(metric_col)}",
                             }
                         )
                 best_day = local.loc[local[metric_col].idxmax()] if not local.empty else None
-                if best_day is not None:
+                if best_day is not None and pd.notna(best_day[date_col]):
+                    try:
+                        best_date_str = str(best_day[date_col].date())
+                    except (AttributeError, TypeError):
+                        best_date_str = str(best_day[date_col])
                     cards.append(
                         {
                             "label": f"Best {self.humanize_label(date_col)}",
-                            "value": str(best_day[date_col].date()),
+                            "value": best_date_str,
                             "metric": metric_col,
                             "formatted": self.format_metric_value(metric_col, best_day[metric_col]),
                             "detail": f"Highest total {self.humanize_label(metric_col)}",
@@ -857,8 +877,11 @@ class AnalyticsEngine:
         title_suffix = f" by {group_col}" if group_col else ""
 
         if chart_type == "heatmap":
-            corr = df[valid_metrics].corr(numeric_only=True)
-            if corr.empty:
+            try:
+                corr = df[valid_metrics].corr(numeric_only=True)
+            except (ValueError, TypeError):
+                return None
+            if corr.empty or corr.isnull().all(axis=None):
                 return None
             return px.imshow(corr, text_auto=".2f", aspect="auto", title=self.chart_title(chart_type, valid_metrics, group_col, agg))
 
@@ -966,7 +989,10 @@ class AnalyticsEngine:
             return pd.DataFrame()
         group_col = date_col or category_col
         if chart_type == "heatmap":
-            return df[valid_metrics].corr(numeric_only=True).reset_index()
+            try:
+                return df[valid_metrics].corr(numeric_only=True).reset_index()
+            except (ValueError, TypeError):
+                return pd.DataFrame()
         if chart_type in ["histogram", "box"]:
             source_cols = [valid_metrics[0]]
             if category_col and category_col in df.columns:

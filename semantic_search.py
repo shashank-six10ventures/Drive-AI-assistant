@@ -175,15 +175,27 @@ class SemanticSearchEngine:
                 self.memory.last_results = results
                 return results
         if any(phrase in lower for phrase in ["show folders", "list folders", "folders available", "what folders"]):
-            results = self.indexer.list_items("folder")[: max(top_k, 100)]
-            self.memory.add_turn(query, [r["file_id"] for r in results])
-            self.memory.last_results = results
-            return results
+            # Only treat as a pure list command when no extra search terms are present.
+            # "show folders" → list all  /  "show folders inside marketing" → fall through to search
+            _folder_remainder = re.sub(r"\b(show|list|all|what are the|folders?|available|drive|my)\b", "", lower).strip()
+            if not _folder_remainder:
+                results = self.indexer.list_items("folder")[: max(top_k, 100)]
+                self.memory.add_turn(query, [r["file_id"] for r in results])
+                self.memory.last_results = results
+                return results
         if any(phrase in lower for phrase in ["all files", "drive files", "list files", "show files", "what are the files"]):
-            results = self.indexer.list_items("file")[: max(top_k, 100)]
-            self.memory.add_turn(query, [r["file_id"] for r in results])
-            self.memory.last_results = results
-            return results
+            # Only treat as a pure list-all command when there are no extra search terms.
+            # "show files" → list all  /  "show files containing aquadoc" → fall through to search
+            _file_remainder = re.sub(r"\b(show|list|all|drive|what are the|files?|dataset|datasets|my)\b", "", lower).strip()
+            if _file_remainder:
+                # Extra terms present — this is a keyword search, not a list command.
+                # Fall through so the query reaches semantic search / filter paths below.
+                pass
+            else:
+                results = self.indexer.list_items("file")[: max(top_k, 100)]
+                self.memory.add_turn(query, [r["file_id"] for r in results])
+                self.memory.last_results = results
+                return results
         if any(phrase in lower for phrase in ["show contents", "inside folder", "in folder", "under folder"]):
             folder_name = self._extract_folder_name(query)
             if folder_name:
@@ -200,7 +212,14 @@ class SemanticSearchEngine:
                 return []
             return self.search_with_filters(query, filters, top_k=top_k, base_rows=base)
 
-        if has_filters:
+        # Only force the filter path when there are *structural* filters (uploader, year, file_type,
+        # explicit keywords).  item_kind alone ("show files containing aquadoc") should still go
+        # through semantic search so the keyword drives ranking, not just a list-all dump.
+        has_structural_filter = any(
+            value not in [None, "", []]
+            for value in [filters.get("uploader"), filters.get("year"), filters.get("file_type"), filters.get("keywords")]
+        )
+        if has_structural_filter:
             return self.search_with_filters(query, filters, top_k=max(top_k, 50), base_rows=None)
 
         candidates = self.indexer.semantic_search(query, top_k=max(top_k, 50))

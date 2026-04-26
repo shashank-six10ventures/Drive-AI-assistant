@@ -392,7 +392,14 @@ class MetadataIndexer:
         q_emb = np.array(self._embed_text(query))
         scored = []
         for row in rows:
-            emb = np.array(json.loads(row["embedding_json"]))
+            if not row["embedding_json"]:
+                # Row has no embedding yet — skip silently (reindex_all() will fix it on next startup).
+                continue
+            try:
+                emb = np.array(json.loads(row["embedding_json"]))
+            except (json.JSONDecodeError, TypeError, ValueError):
+                logging.warning("Skipping file %s: could not parse embedding_json.", row["file_id"])
+                continue
             if emb.shape != q_emb.shape:
                 logging.warning(
                     "Skipping file %s in semantic search: embedding shape %s does not match query shape %s. "
@@ -430,31 +437,87 @@ class MetadataIndexer:
         self.conn.commit()
         return len(ids)
 
+    def _expected_embedding_size(self) -> int:
+        """Return the embedding vector length the current backend produces."""
+        return len(self._embed_text("probe"))
+
+    def _has_stale_embeddings(self) -> bool:
+        """Return True if any row has a NULL or wrong-size embedding."""
+        expected = self._expected_embedding_size()
+        rows = self.conn.execute("SELECT file_id, embedding_json FROM files").fetchall()
+        for row in rows:
+            emb_json = row["embedding_json"]
+            if not emb_json:
+                return True
+            try:
+                emb = json.loads(emb_json)
+                if len(emb) != expected:
+                    return True
+            except Exception:
+                return True
+        return False
+
+    def reindex_all(self) -> int:
+        """Re-embed every row using the current backend. Fixes shape mismatches after
+        switching embedding backends (e.g. sentence_transformers → hashing)."""
+        rows = self.conn.execute("SELECT * FROM files").fetchall()
+        count = 0
+        for row in rows:
+            text = " ".join([
+                row["file_name"] or "",
+                row["summary"] or "",
+                (row["keywords"] or ""),
+                (row["text_content"] or "")[:5000],
+            ])
+            embedding = self._embed_text(text)
+            self.conn.execute(
+                "UPDATE files SET embedding_json=? WHERE file_id=?",
+                (json.dumps(embedding), row["file_id"]),
+            )
+            count += 1
+        self.conn.commit()
+        logging.info("Re-indexed %d rows with new embeddings (shape=%d).", count, self._expected_embedding_size())
+        return count
+
     def ensure_dummy_data_ready(self) -> int:
-        # Repairs stale demo state where dummy rows exist but local files are missing.
+        """Ensure demo data is present, local files exist, and embeddings are fresh.
+
+        Repairs three classes of stale state:
+          1. No dummy rows at all → seed from scratch.
+          2. Dummy rows exist but local .xlsx/.csv files are gone → wipe and re-seed.
+          3. Embeddings are the wrong shape (backend switch) → reindex all rows.
+        """
         dummy_rows = self.conn.execute(
             "SELECT file_id, local_path FROM files WHERE file_id LIKE 'dummy_%'"
         ).fetchall()
+
         if not dummy_rows:
             seeded = self.seed_dummy_data_if_empty()
             if not seeded:
                 return 0
+            if self._has_stale_embeddings():
+                self.reindex_all()
             row = self.conn.execute(
                 "SELECT COUNT(*) AS c FROM files WHERE file_id LIKE 'dummy_%'"
             ).fetchone()
             return int(row["c"])
 
-        valid_local_files = 0
-        for row in dummy_rows:
-            local_path = row["local_path"] or ""
-            if local_path and Path(local_path).exists():
-                valid_local_files += 1
+        # Check local files are still on disk
+        valid_local_files = sum(
+            1 for row in dummy_rows
+            if row["local_path"] and Path(row["local_path"]).exists()
+        )
 
-        if valid_local_files > 0:
-            return valid_local_files
+        if valid_local_files == 0:
+            # Local dummy files deleted — wipe and re-seed
+            self.remove_dummy_data()
+            self.seed_dummy_data_if_empty()
 
-        self.remove_dummy_data()
-        self.seed_dummy_data_if_empty()
+        # Fix stale embeddings regardless of whether we just re-seeded
+        if self._has_stale_embeddings():
+            logging.info("Stale embeddings detected — re-indexing all rows.")
+            self.reindex_all()
+
         repaired_rows = self.conn.execute(
             "SELECT COUNT(*) AS c FROM files WHERE file_id LIKE 'dummy_%'"
         ).fetchone()["c"]

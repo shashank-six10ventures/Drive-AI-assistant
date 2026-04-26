@@ -337,25 +337,27 @@ def _show_chat_history() -> None:
             if msg["role"] == "assistant" and msg.get("for_query"):
                 st.caption(f"Response to: {msg['for_query']}")
             st.write(msg["content"])
-            if msg["role"] == "assistant" and msg.get("results"):
+            if msg["role"] == "assistant" and isinstance(msg.get("results"), list) and msg["results"]:
                 with st.expander(f"Results for this question ({len(msg['results'])})", expanded=False):
                     for idx, result in enumerate(msg["results"][:8], start=1):
-                        st.markdown(f"**{idx}. {result['file_name']}**  \nKind: `{result.get('item_kind', 'file')}`  \nUploader: `{result.get('uploader_name', '-')}`")
+                        if not isinstance(result, dict):
+                            continue
+                        st.markdown(f"**{idx}. {result.get('file_name', '?')}**  \nKind: `{result.get('item_kind', 'file')}`  \nUploader: `{result.get('uploader_name', '-')}`")
             if msg["role"] == "assistant" and msg.get("compare_rows"):
                 with st.expander("Comparison output", expanded=False):
-                    st.dataframe(pd.DataFrame(msg["compare_rows"]), use_container_width=True)
+                    st.dataframe(pd.DataFrame(msg["compare_rows"]), width="stretch")
             if msg["role"] == "assistant" and msg.get("analysis_rows"):
                 with st.expander("Current dataset analysis", expanded=False):
-                    st.dataframe(pd.DataFrame(msg["analysis_rows"]), use_container_width=True)
+                    st.dataframe(pd.DataFrame(msg["analysis_rows"]), width="stretch")
             if msg["role"] == "assistant" and msg.get("rename_preview"):
                 with st.expander("Rename preview", expanded=False):
-                    st.dataframe(pd.DataFrame(msg["rename_preview"]), use_container_width=True)
+                    st.dataframe(pd.DataFrame(msg["rename_preview"]), width="stretch")
             if msg["role"] == "assistant" and msg.get("alerts_rows"):
                 with st.expander("Alerts", expanded=False):
-                    st.dataframe(pd.DataFrame(msg["alerts_rows"]), use_container_width=True)
+                    st.dataframe(pd.DataFrame(msg["alerts_rows"]), width="stretch")
             if msg["role"] == "assistant" and msg.get("market_rows"):
                 with st.expander("Market comparison", expanded=False):
-                    st.dataframe(pd.DataFrame(msg["market_rows"]), use_container_width=True)
+                    st.dataframe(pd.DataFrame(msg["market_rows"]), width="stretch")
 
 
 def _summarize_results_rule_based(results: List[Dict]) -> str:
@@ -401,8 +403,12 @@ def _summarize_dataset_rule_based(file_name: str, metrics: Dict, anomalies: Dict
 def _summarize_market_compare_rule_based(compare_df: pd.DataFrame) -> str:
     if compare_df.empty:
         return "No market comparison could be produced from the current dataset."
+    required = {"market_price", "price_gap", "market_item"}
+    if not required.issubset(compare_df.columns):
+        return "Market comparison data is missing required columns (market_price, price_gap, market_item)."
     cheapest = compare_df.sort_values("market_price").iloc[0]
-    highest_gap = compare_df.iloc[compare_df["price_gap"].abs().idxmax()]
+    # idxmax() returns an index *label*, not a positional offset — use .loc not .iloc.
+    highest_gap = compare_df.loc[compare_df["price_gap"].abs().idxmax()]
     return (
         f"Cheapest matching Amazon listing is `{cheapest['market_item']}` at {cheapest['market_price']:,.2f}. "
         f"The largest gap versus your internal average is `{highest_gap['market_item']}` with a gap of {highest_gap['price_gap']:,.2f}."
@@ -492,8 +498,7 @@ def _render_column_guide(profile: Dict) -> None:
 
 
 def _scroll_chat_to_bottom() -> None:
-    st.components.v1.html(
-        """
+    st.html("""
         <script>
         const scrollTarget = window.parent.document.querySelector('[data-testid="stAppViewContainer"]');
         if (scrollTarget) {
@@ -502,9 +507,7 @@ def _scroll_chat_to_bottom() -> None:
             });
         }
         </script>
-        """,
-        height=0,
-    )
+        """)
 
 
 def _render_kpi_cards(
@@ -551,7 +554,9 @@ def _render_benchmark_cards(cards: List[Dict]) -> None:
             </div>
             """
         )
-    st.markdown(f"<div class='benchmark-grid'>{''.join(chunks)}</div>", unsafe_allow_html=True)
+    # Use st.html() for reliable rendering of custom CSS-class HTML blocks.
+    # st.markdown with unsafe_allow_html can mis-render multi-div grids in some Streamlit builds.
+    st.html(f"<div class='benchmark-grid'>{''.join(chunks)}</div>")
 
 
 def _render_chart_reasons(chart_reasons: List[Dict]) -> None:
@@ -567,7 +572,7 @@ def _slugify(text: str) -> str:
 
 
 def _render_anchor(anchor_id: str) -> None:
-    st.markdown(f"<div id='{anchor_id}'></div>", unsafe_allow_html=True)
+    st.html(f"<div id='{anchor_id}'></div>")
 
 
 def _render_dataset_mini_nav(dataset_id: str) -> None:
@@ -583,14 +588,13 @@ def _render_dataset_mini_nav(dataset_id: str) -> None:
         ("Exports", f"{dataset_id}-exports"),
     ]
     links = "".join([f"<a href='#{anchor}'>{label}</a>" for label, anchor in sections])
-    st.markdown(
+    st.html(
         f"""
         <details class="dataset-mini-nav" open>
             <summary>Jump within this dataset</summary>
             <div>{links}</div>
         </details>
-        """,
-        unsafe_allow_html=True,
+        """
     )
 
 
@@ -606,7 +610,7 @@ def _render_dataset_toolbar(
     metric_text = primary_metric or "No primary metric detected"
     time_text = time_dim or "No time grain detected"
     category_text = category_dim or "No category grain detected"
-    st.markdown(
+    st.html(
         f"""
         <div class="dataset-toolbar">
             <div class="dataset-toolbar-title">{file_name}</div>
@@ -619,8 +623,7 @@ def _render_dataset_toolbar(
                 <strong>Category grain:</strong> {category_text}
             </div>
         </div>
-        """,
-        unsafe_allow_html=True,
+        """
     )
 
 
@@ -630,7 +633,7 @@ def _render_chart_grid(figures: List) -> None:
     cols = st.columns(2)
     for idx, fig in enumerate(figures):
         with cols[idx % 2]:
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
 
 
 def _figure_png_bytes(fig):
@@ -680,7 +683,7 @@ def _render_chart_panels(panels: List[Dict], dataset_id: str, section_key: str) 
     cols = st.columns(2)
     for idx, panel in enumerate(panels):
         with cols[idx % 2]:
-            st.plotly_chart(panel["figure"], use_container_width=True)
+            st.plotly_chart(panel["figure"], width="stretch")
             btn_cols = st.columns(2)
             png_bytes = _figure_png_bytes(panel["figure"])
             with btn_cols[0]:
@@ -839,7 +842,7 @@ def _render_file_actions(indexer: MetadataIndexer, analytics: AnalyticsEngine) -
                                 ordered_cols = [col for col in merged_df.columns if col in common_cols or col == "source_file"]
                                 merged_df = merged_df[ordered_cols]
                         st.caption(f"Merged preview across {len(merge_datasets)} files")
-                        st.dataframe(merged_df.head(50), use_container_width=True)
+                        st.dataframe(merged_df.head(50), width="stretch")
                         st.download_button(
                             "Download merged CSV",
                             data=merged_df.to_csv(index=False).encode("utf-8"),
@@ -961,7 +964,7 @@ def _render_dataset_dashboard(
         if not grouped_preview.empty:
             preview_label = date_col or category_col or "overall dataset"
             st.caption(f"Preview table aggregated by `{preview_label}` using `{agg}`.")
-            st.dataframe(grouped_preview.head(20), use_container_width=True)
+            st.dataframe(grouped_preview.head(20), width="stretch")
 
         panels = analytics.dashboard_panels(
             df=df,
@@ -1022,7 +1025,7 @@ def _render_grouped_anomaly_review(
                 "Values outside this IQR range are flagged for review."
             )
         if anomalies["rows"]:
-            st.dataframe(pd.DataFrame(anomalies["rows"]).head(20), use_container_width=True)
+            st.dataframe(pd.DataFrame(anomalies["rows"]).head(20), width="stretch")
         else:
             st.caption("No raw-row anomalies were detected for the selected metric.")
         return
@@ -1037,14 +1040,14 @@ def _render_grouped_anomaly_review(
     grouped_table = pd.DataFrame(grouped.get("grouped_table", []))
     if not grouped_table.empty:
         st.caption(f"Grouped view for anomaly detection by `{selected_grain}`")
-        st.dataframe(grouped_table.head(30), use_container_width=True)
+        st.dataframe(grouped_table.head(30), width="stretch")
         grouped_chart = analytics.create_chart(grouped_table, "bar", [primary_metric], category_col=selected_grain, agg="sum")
         if grouped_chart:
-            st.plotly_chart(grouped_chart, use_container_width=True)
+            st.plotly_chart(grouped_chart, width="stretch")
     flagged_rows = pd.DataFrame(grouped["rows"])
     if not flagged_rows.empty:
         st.caption("Flagged grouped anomalies")
-        st.dataframe(flagged_rows, use_container_width=True)
+        st.dataframe(flagged_rows, width="stretch")
     else:
         st.caption(f"No grouped anomalies were detected by `{selected_grain}`.")
 
@@ -1092,13 +1095,13 @@ def _render_cross_file_dashboard(datasets: List[Dict], analytics: AnalyticsEngin
         if compare_df.empty:
             st.info("No comparable values were produced for the selected metrics.")
             return
-        st.dataframe(compare_df, use_container_width=True)
+        st.dataframe(compare_df, width="stretch")
         if chart_type == "heatmap":
             fig = analytics.create_chart(compare_df, "heatmap", metrics=compare_metrics)
         else:
             fig = analytics.create_chart(compare_df, chart_type, metrics=compare_metrics, category_col="file_name")
         if fig:
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
 
 
 def _render_drive_explorer(indexer: MetadataIndexer) -> None:
@@ -1154,7 +1157,7 @@ def _render_drive_explorer(indexer: MetadataIndexer) -> None:
                         for item in descendants
                     ]
                 ),
-                use_container_width=True,
+                width="stretch",
             )
 
 
@@ -1644,6 +1647,15 @@ if user_query:
             if has_meaningful_filters
             else search_engine.search(user_query, top_k=12)
         )
+
+        # ── Zero-results recovery ────────────────────────────────────────────
+        # When a scoped/filtered search returns nothing, fall back to a global
+        # name search so follow-up questions don't silently dead-end.
+        if not results and (has_specific_filters or base_rows is not None):
+            fallback = search_engine.search_with_filters(user_query, filters, top_k=12, base_rows=None)
+            if fallback:
+                results = fallback
+
         st.session_state["last_results"] = results
         st.session_state["latest_results"] = results
         st.session_state["last_selected_files"] = []
@@ -1651,7 +1663,20 @@ if user_query:
         files = len([r for r in results if r.get("item_kind", "file") == "file"])
         assistant_text = f"I found {len(results)} matching items ({files} files, {folders} folders)."
         if not results:
-            assistant_text = "No matching Drive items found. Try a folder name, file name, uploader, or keyword."
+            # Give the user actionable guidance when nothing matched.
+            uploader_hint = filters.get("uploader")
+            if uploader_hint:
+                assistant_text = (
+                    f"No files uploaded by **{uploader_hint}** were found in the current index. "
+                    "If you're using demo data, try `Run Monitor Once` to sync real Drive files. "
+                    "You can also ask `show all files` to see what's indexed."
+                )
+            else:
+                assistant_text = (
+                    "No matching Drive items found. "
+                    "Try a folder name, file name, uploader (`uploaded by Name`), or a keyword. "
+                    "Ask `show all files` to browse the full index."
+                )
 
     # Persist LLM usage counters back to session state so they survive reruns.
     st.session_state["llm_call_count"] = ai_router._calls
@@ -1706,21 +1731,21 @@ if user_query:
 
         if st.session_state["latest_compare_df"] is not None:
             compare_df = st.session_state["latest_compare_df"]
-            st.dataframe(compare_df, use_container_width=True)
+            st.dataframe(compare_df, width="stretch")
             fig = analytics.compare_chart(compare_df)
             if fig:
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width="stretch")
 
         if dataset_query_table is not None and not dataset_query_table.empty:
-            st.dataframe(dataset_query_table, use_container_width=True)
+            st.dataframe(dataset_query_table, width="stretch")
         if dataset_query_chart is not None:
-            st.plotly_chart(dataset_query_chart, use_container_width=True)
+            st.plotly_chart(dataset_query_chart, width="stretch")
 
         if trend_fig is not None:
-            st.plotly_chart(trend_fig, use_container_width=True)
+            st.plotly_chart(trend_fig, width="stretch")
 
         if combined_df is not None:
-            st.dataframe(combined_df, use_container_width=True)
+            st.dataframe(combined_df, width="stretch")
             export_name = f"combined_dataset_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
             csv_bytes = combined_df.to_csv(index=False).encode("utf-8")
             st.download_button(
@@ -1742,27 +1767,27 @@ if user_query:
             )
 
         if rename_preview:
-            st.dataframe(pd.DataFrame(rename_preview), use_container_width=True)
+            st.dataframe(pd.DataFrame(rename_preview), width="stretch")
 
         if st.session_state.get("latest_alerts"):
-            st.dataframe(pd.DataFrame(st.session_state["latest_alerts"]), use_container_width=True)
+            st.dataframe(pd.DataFrame(st.session_state["latest_alerts"]), width="stretch")
 
         if st.session_state.get("executive_brief"):
             brief = st.session_state["executive_brief"]
             if brief.get("kpis"):
-                st.dataframe(pd.DataFrame(brief["kpis"]), use_container_width=True)
+                st.dataframe(pd.DataFrame(brief["kpis"]), width="stretch")
             if brief.get("alerts"):
-                st.dataframe(pd.DataFrame(brief["alerts"]), use_container_width=True)
+                st.dataframe(pd.DataFrame(brief["alerts"]), width="stretch")
 
         if market_compare_df is not None:
-            st.dataframe(market_compare_df, use_container_width=True)
+            st.dataframe(market_compare_df, width="stretch")
             if not market_compare_df.empty:
                 fig = analytics.comparison_chart(market_compare_df, category_col="market_item", value_col="market_price")
                 if fig:
-                    st.plotly_chart(fig, use_container_width=True)
+                    st.plotly_chart(fig, width="stretch")
         if market_raw_results:
             st.write("Amazon matches")
-            st.dataframe(pd.DataFrame(market_raw_results), use_container_width=True)
+            st.dataframe(pd.DataFrame(market_raw_results), width="stretch")
 
         if web_comparison:
             st.write(web_comparison)
@@ -1772,7 +1797,9 @@ if user_query:
 
 st.divider()
 st.subheader("Business Overview")
-current_context_datasets = _load_context_datasets(indexer, analytics)
+# Load context datasets once and reuse across Business Overview and Interactive Dashboard
+# to avoid triple-loading the same files on every rerun.
+current_context_datasets = _load_context_datasets(indexer, analytics, prefer_selected=True)
 if current_context_datasets:
     brief = analytics.executive_brief(current_context_datasets)
     total_rows = sum(kpi.get("rows", 0) for kpi in brief["kpis"])
@@ -1794,14 +1821,15 @@ if current_context_datasets:
     with st.expander("KPI table", expanded=False):
         kpi_df = pd.DataFrame(brief["kpis"])
         if not kpi_df.empty:
-            st.dataframe(kpi_df, use_container_width=True)
+            st.dataframe(kpi_df, width="stretch")
     st.write(_summarize_brief_rule_based(brief))
 else:
     st.caption("Add files to the basket or select datasets below to generate executive KPIs and alerts.")
 
 st.divider()
 st.subheader("Interactive Dashboard")
-dashboard_context = _load_context_datasets(indexer, analytics, query="selected dashboard", prefer_selected=True)
+# Reuse the same datasets already loaded for Business Overview above (same selection, same rerun).
+dashboard_context = current_context_datasets
 if dashboard_context:
     _render_cross_file_dashboard(dashboard_context, analytics, key_prefix="global_dashboard")
     for dashboard_item in dashboard_context[:3]:
@@ -1897,7 +1925,7 @@ if selected:
         _render_anchor(f"{dataset_anchor_base}-full-table")
         with st.expander("Full table", expanded=True):
             st.caption("Showing the full cleaned dataset below. Scroll horizontally and vertically as needed.")
-            st.dataframe(df, use_container_width=True, height=620)
+            st.dataframe(df, width="stretch", height=620)
             csv_bytes = df.to_csv(index=False).encode("utf-8")
             st.download_button(
                 f"Download cleaned CSV for {info['file_name']}",
